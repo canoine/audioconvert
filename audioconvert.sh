@@ -145,7 +145,7 @@ function detect_formats () {
 
 	# Recuperation du chemin absolu du repertoire
 	cd "${REP_SRC}"
-	REP_SRC=$(pwd)
+	REP_SRC="$(pwd)"
 
 	# Formats destination
 	case ${FORMAT_DEST^^} in
@@ -266,18 +266,18 @@ function encode_dest () {
 # Traitement des arguments
 while getopts c:d:f:o:s: option
 do
-	case $option in
+	case ${option} in
 		h)	usage				;;
-		s)	FORMAT_SRC="$OPTARG"		;;
-		d)	FORMAT_DEST="$OPTARG"		;;
-		c)	OPT_CUE="$OPTARG"		;;
-		o)	ENCSUPPOPTS="$OPTARG"		;;
+		s)	FORMAT_SRC="${OPTARG}"		;;
+		d)	FORMAT_DEST="${OPTARG}"		;;
+		c)	OPT_CUE="${OPTARG}"		;;
+		o)	ENCSUPPOPTS="${OPTARG}"		;;
 	esac
 done
 shift $((OPTIND-1))
 
-[ $# -ne 1 ] && usage
-FIC_SRC="$1"
+[ $# -eq 1 ] || usage
+FIC_SRC="${1}"
 detect_formats
 
 # Decompression
@@ -288,7 +288,7 @@ then
 else
 	ls "${REP_SRC}"/*.${FORMAT_SRC,,} | while read fic
 	do
-		decode_src "$fic"
+		decode_src "${fic}"
 	done
 fi
 
