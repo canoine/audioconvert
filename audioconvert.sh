@@ -2,7 +2,7 @@
 
 
 # Quelques variables
-VERSION="0.2a"
+VERSION="0.3"
 FORMAT_SRC="flac"		# Format des fichiers a traiter
 FORMAT_DEST="mpc"		# Format des fichiers en fin de traitement
 
@@ -10,6 +10,8 @@ APEBIN="mac"			# Monkey audio
 APEDECOPTS="-d"			# Monkey audio (args)
 FLACBIN="flac"			# FLAC
 FLACDECOPTS="-df"		# FLAC (args)
+WVBIN="wvunpack"		# WAVPACK
+WVDECOPTS=""			# WAVPACK (args)
 
 SPLITBIN="bchunk"
 SPLITOPTS="-vw"
@@ -38,7 +40,7 @@ function usage () {
 		   comme argument a -f (defaut : FLAC)
 
 	Formats acceptes :
-	- en decompression : WAV, FLAC, APE
+	- en decompression : WAV, FLAC, APE, WAVPACK
 	- en compression : MPC, MP3
 
 	Exemples de parametres a passer a l'encodeur :
@@ -104,8 +106,15 @@ function detect_formats () {
 				exit 12
 				;;
 			*)
-				echo "$FIC_SRC est un fichier de format inconnu. Stop."
-				exit 13
+				EXT=`echo $FIC_SRC | awk -F "." {'print $NF'}`
+				if [ "x$EXT" == "xwv" ]
+				then
+					echo "$FIC_SRC est un fichier WAVPACK."
+					FORMAT_SRC="wv"
+				else
+					echo "$FIC_SRC est un fichier de format inconnu. Stop."
+					exit 13
+				fi
 				;;
 		esac
 
@@ -128,6 +137,10 @@ function detect_formats () {
 			FLAC|flac|Flac)
 				echo " *****  Format d'entree : FLAC"
 				FORMAT_SRC="flac"
+				;;
+			WAVPACK|wavpack|Wavpack)
+				echo " *****  Format d'entree : WAVPACK"
+				FORMAT_SRC="wv"
 				;;
 			*)
 				echo "Format d'entree non gere. Stop."
@@ -155,6 +168,7 @@ function decode_src () {
 		wav)	echo " *****  Fichier $SOURCE non compresse."	;;
 		flac)	$FLACBIN $FLACDECOPTS "$SOURCE"			;;
 		ape)	$APEBIN "$SOURCE" "$FIC_DEC" $APEDECOPTS	;;
+		wv)	$WVBIN $WVDECOPTS "$SOURCE" 			;;
 	esac
 
 	if [ $? -ne 0 ]
@@ -243,4 +257,3 @@ fi
 # separes, un par morceau
 # Reste plus qu'a recompresser dans le format voulu
 encode_dest
-
