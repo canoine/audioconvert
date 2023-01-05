@@ -10,56 +10,79 @@
 # - découpage (WAV) : binaire bchunk
 # - rééchantillonnage (WAV) : binaire sox
 # - lecture des metatags :
-#		- dans un fichier CUE : binaire cueprint
-#		- dans un fichier audio : selon le format (voir %codecs)
+#	- dans un fichier CUE : binaire cueprint
+#	- dans un fichier audio : selon le format (voir %codecs)
 #
 ###
 #
 # Changelog :
-# 0.6 :	- réécriture complète du script (intialement en shell) en perl
-#		- écriture des tags
-#		- écriture ou réécriture des playlists M3U
-#		- rééchantillonnement des fichiers WAV selon les codecs
-#
-# En cours :
-# 	- Ajout ReplayGain
+# 0.6 :
+#	- réécriture complète du script (intialement en shell) en perl
+#	- écriture des tags
+#	- écriture ou réécriture des playlists M3U
+#	- rééchantillonnement des fichiers WAV selon les codecs et
+#		le format des fichiers WAV
+# 0.7 :
+#	- ajout des options -t en ligne de comande
+#	- ajout des tags ReplayGain
+#	- création et utilisation de tags globaux
+#	- détection du clipping et application du niveau de réduction du signal
+#	- option forcée ou non de déplacement des fichiers SOURCE et CUE
+# 		dans un sous-répertoire ./SRC/
 #
 # TODO :
 #	- maintenant qu'on a introduit sox, on devrait pouvoir remplacer
 # 		d'autres binaires, histoire de réduire les dépendances
-#	- split_wav : récupération des tags à partir du fichier CUE uniquement...
 #
 ###
 #
-# CNE - 20200327
+# CNE - 20200404
 #
-my $version = "0.6";
-
+###
 use strict;
 use warnings;
 use Audio::Musepack;
-use Data::Dumper;
+#use Data::Dumper;
 use File::Basename;
+use File::Copy;
 use File::MimeInfo::Magic;
+use File::Path qw(make_path remove_tree);
 use File::Spec;
 use File::Which;
 use Fcntl;
 use Getopt::Long qw(:config no_ignore_case bundling);
 
 my $prog = basename $0;
+my $version = "0.7";
 
 # Options par défaut
-my $debug;						# Sortie debug ?
+my $archive;					# Archivage des fichiers sources dans ./SRC/ ?
 my $dec_opts;					# Options supplémentaires à passer au décodeur
+my $debug;						# Sortie debug ?
+my @def_tags = (
+				"ALBUMARTIST",
+				"ARTIST",
+				"ALBUM",
+				"TITLE",
+				"YEAR",
+				"TRACKNUMBER",
+				"TRACKSTOTAL",
+				"DISCNUMBER",
+				"DISCSTOTAL",
+				);				# Liste des tags qui nous intéressent
 my $empty;						# Doit-on supprimer le fichier source ?
 my $enc_opts;					# Options supplémentaires à passer à l'encodeur
 my $fic_cue;					# Nom du fichier .CUE
-my $fic_src;					# Nom du fichier ou du répertoire source
+my $fic_src;					# Nom du fichier ou du répertoire SOURCE
 my $fmt_src			= 'flac';	# Format des fichiers sources
-my $fmt_dst			= 'flac';	# Format des fichiers destinations
+my $fmt_dst			= 'mpc';	# Format des fichiers destinations
+my %gtags;						# Ensemble des tags globaux
+my $noclip;						# Doit-on désactiver le calcul anti-clipping ?
 my $noreplaygain;				# Doit-on désactiver les tags ReplayGain ?
-my $src_is_rep;					# La source est-elle un répertoire ?
+my $split;						# La source est-elle un fichier à découper ?
+my $src_is_rep;					# le chemin SOURCE est-il un répertoire ?
 my $verbose;					# Sortie verbeuse ?
+my $volume			= 1;		# Volume des fichiers lossy finaux (anti-clip)
 # Et ça, c'est pour alléger le code.
 my %fmt_src;					# options par défaut du format source
 my %fmt_dst;					# options par défaut du format destination
@@ -69,31 +92,27 @@ my %fmt_dst;					# options par défaut du format destination
 #
 #	format1 => {
 #		dec_bin			=>	"exécutable",		# scalaire
-#		dec_opts		=>	"--options",		# chaîne scalaire
-#		dec_verb_opt	=>	"--verbose",		# scalaire
 #		dec_info_opt	=>	"--silent",			# scalaire
+#		dec_opts		=>	"--options",		# chaîne scalaire
 #		dec_tag_sub		=>	\&fonction,			# fonction
 #		dec_tag_bin		=>	"exécutable",		# scalaire
 #		dec_tags_opts	=>	"--option=",		# chaîne scalaire
+#		dec_verb_opt	=>	"--verbose",		# scalaire
 #		enc_bin			=>	"exécutable",		# scalaire
-#		enc_opts		=>	"--options",		# chaîne scalaire
-#		enc_verb_opt	=>	"--verbose",		# scalaire
 #		enc_info_opt	=>	"--silent",			# scalaire
+#		enc_opts		=>	"--options",		# chaîne scalaire
 #		enc_tags_sub	=>	"fonction",			# scalaire
 #		enc_tags_bin	=>	"exécutable",		# scalaire
 #		enc_tags_opts	=>	"--option=",		# chaîne scalaire
+#		enc_verb_opt	=>	"--verbose",		# scalaire
+#		enc_vol_opt		=>	"--option=",		# chaîne scalaire
 #		ext				=>	"extension",		# scalaire
-#		rg_bin			=>	"exécutable",		# scalaire
-#		rg_opts			=>	""--options",		# chaîne scalaire
+#		rpg_bin			=>	"exécutable",		# scalaire
+#		rpg_opts			=>	""--options",		# chaîne scalaire
 #		tags			=>	{					# hash
-#			artist			=>	'nom',			# scalaire
-#			album			=>	'nom',			# scalaire
-#			title			=>	'nom',			# scalaire
-#			date			=>	'nom',			# scalaire
-#			track_number	=>	'nom',			# scalaire
-#			tracks_total	=>	'nom',			# scalaire
-#			disc_number		=>	'nom',			# scalaire
-#			discs_total		=>	'nom'			# scalaire
+#			TAG1			=>	'nom',			# scalaire
+#			TAG2			=>	'nom',			# scalaire
+#			(...)								# liste des tags : @def_tags
 #		}
 #	},
 #
@@ -110,14 +129,15 @@ my %fmt_dst;					# options par défaut du format destination
 # - "dec_tags"_opts est facultatif,
 # - "enc_bin" est facultatif, mais il ne sera pas possible d'utiliser
 #		ce codec pour compresser des fichiers si absent,
-# - "enc_opts", "enc_verb_opt" et "enc_info_opt" sont facultatifs,
+# - "enc_opts", "enc_verb_opt", "enc_vol_opt" et "enc_info_opt"
+#		sont facultatifs,
 # - au moins une des deux clefs "enc_tag_sub" / "enc_tag_bin" est nécessaire
 #		pour écrire les tags d'un fichier destination,
 # - "enc_tags"_opts est facultatif ("enc_bin" sera utilisé si absent),
 # - "ext" est facultatif ("format" sera utilisé comme extension si absent),
-# - "rg_bin" est facultatif, mais il ne sera pas possible d'ajouter des tags
+# - "rpg_bin" est facultatif, mais il ne sera pas possible d'ajouter des tags
 #		ReplayGain sur des fichiers de ce format si absent,
-# - "rg_opts" est facultatif,
+# - "rpg_opts" est facultatif,
 # - le sous-tableau "tags" complet est obligatoire :
 #		- pour extraire les tags d'un fichier source (mais le script utilise
 #			de préférence les données du fichier CUE lorsque c'est possible).
@@ -126,48 +146,49 @@ my %fmt_dst;					# options par défaut du format destination
 
 my %codecs = (
 
-# Monkey audio. Lossless, mais pas libre.
+# Monkey audio. Lossless, mais pas libre. Et lent. Et anti-clipping agressif ?
 # En décompression uniquement.
 	'ape'	=>	{
 		dec_bin			=>	"mac",
 		dec_opts		=>	"-d",
 		dec_tag_sub		=>	\&extract_APE_tags,
 		tags			=>	{
-			artist			=>	'ARTIST',
-			album			=>	'ALBUM',
-			albumartist		=>	'ALBUM ARTIST',
-			title			=>	'TITLE',
-			date			=>	'YEAR',
-			track_number	=>	'TRACK',
-			tracks_total	=>	'/TRACK',
-			disc_number		=>	'DISC',
-			discs_total		=>	'/DISC'
+			ARTIST			=>	'ARTIST',
+			ALBUM			=>	'ALBUM',
+			ALBUMARTIST		=>	'ALBUM ARTIST',
+			TITLE			=>	'TITLE',
+			DATE			=>	'YEAR',
+			TRACKNUMBER		=>	'TRACK',
+			TRACKSTOTAL		=>	'/TRACK',
+			DISCNUMBER		=>	'DISC',
+			DISCSTOTAL		=>	'/DISC'
 		}
 	},
 
-# FLAC. Libre, et Lossless.
+# FLAC. Libre, rapide, et Lossless.
+# Sert à déterminer le niveau de clipping.
 	'flac'	=>	{
 		dec_opts		=>	"--decode --force --decode-through-errors",
 		dec_info_opt	=>	"--silent",
 		dec_tag_bin		=>	"metaflac",
 		dec_tags_opts	=>	"--export-tags-to='-'",
 		enc_bin			=>	"flac",
-		enc_opts		=>	"--best --force --output-name",
 		enc_info_opt	=>	"--silent",
+		enc_opts		=>	"--best --force --output-name",
 		enc_tags_opts	=>	"--tag=",
 		dec_bin			=>	"flac",
-		rg_bin			=>	"metaflac",
-		rg_opts			=>	"--add-replay-gain",
+		rpg_bin			=>	"metaflac",
+		rpg_opts		=>	"--add-replay-gain",
 		tags			=>	{
-			artist			=>	'ARTIST',
-			album			=>	'ALBUM',
-			albumartist		=>	'ALBUMARTIST',
-			title			=>	'TITLE',
-			date			=>	'DATE',
-			track_number	=>	'TRACKNUMBER',
-			tracks_total	=>	'TRACKTOTAL',
-			disc_number		=>	'DISCNUMBER',
-			discs_total		=>	'DISCTOTAL'
+			ARTIST			=>	'ARTIST',
+			ALBUM			=>	'ALBUM',
+			ALBUMARTIST		=>	'ALBUMARTIST',
+			TITLE			=>	'TITLE',
+			DATE			=>	'DATE',
+			TRACKNUMBER		=>	'TRACKNUMBER',
+			TRACKSTOTAL		=>	'TRACKTOTAL',
+			DISCNUMBER		=>	'DISCNUMBER',
+			DISCSTOTAL		=>	'DISCTOTAL'
 		}
 	},
 
@@ -177,19 +198,20 @@ my %codecs = (
 	'mp3'	=>	{
 		enc_bin			=>	"lame",
 		enc_opts		=>	"-V 3",
-		enc_verb_opt	=>	"--verbose",
-		enc_info_opt	=>	"--brief",
 		enc_tags_opts	=>	"--add-id3v2",
+		enc_verb_opt	=>	"--verbose",
+		enc_vol_opt		=>	"--scale",
+		enc_info_opt	=>	"--brief",
 		tags			=>	{
-			artist			=>	'--ta',
-			album			=>	'--tl',
-			albumartist		=>	'--tv TPE2',
-			title			=>	'--tt',
-			date			=>	'--ty',
-			track_number	=>	'--tn',
-			tracks_total	=>	'/--tn',
-			disc_number		=>	'--tv TPOS',
-			discs_total		=>	'/--tv TPOS'
+			ARTIST			=>	'--ta',
+			ALBUM			=>	'--tl',
+			ALBUMARTIST		=>	'--tv TPE2',
+			TITLE			=>	'--tt',
+			DATE			=>	'--ty',
+			TRACKNUMBER		=>	'--tn',
+			TRACKSTOTAL		=>	'/--tn',
+			DISCNUMBER		=>	'--tv TPOS',
+			DISCSTOTAL		=>	'/--tv TPOS'
 		}
 	},
 
@@ -197,28 +219,30 @@ my %codecs = (
 # par ses créateurs et celle qui devrait être privilégiée.
 # Problème : pas grand chose n'est compatible avec cette version.
 # Bugs :
-#	- ne sait pas compresser des fichiers WAV avec plus de deux canaux
-#	- ne sait pas compresser des fichiers WAV cadencé à plus de 48 kHz
+# - ne sait pas compresser des fichiers WAV avec plus de deux canaux
+# - ne sait pas compresser des fichiers WAV cadencés à plus de 48 kHz
+# - ne sait pas compresser des fichiers WAV avec plus de 16 bits par échantillon
 # Le script essaiera de rééchantillonner les fichiers s'il trouve sox
 	'mpc8'	=>	{
 		enc_bin			=>	"mpcenc",
 		enc_opts		=>	"--insane --overwrite",
-		enc_verb_opt	=>	"--verbose",
 		enc_tags_opts	=>	"--tag",
+		enc_verb_opt	=>	"--verbose",
+		enc_vol_opt		=>	"--scale",
 		dec_bin			=>	"mpcdec",
 		dec_tag_sub		=>	\&extract_APE_tags,
 		ext				=>	"mpc",
-		rg_bin			=>	"mpcgain",
+		rpg_bin			=>	"mpcgain",
 		tags			=>	{
-			artist			=>	'ARTIST',
-			album			=>	'ALBUM',
-			albumartist		=>	'ALBUM ARTIST',
-			title			=>	'TITLE',
-			date			=>	'YEAR',
-			track_number	=>	'TRACK',
-			tracks_total	=>	'/TRACK',
-			disc_number		=>	'DISC',
-			discs_total		=>	'/DISC'
+			ARTIST			=>	'ARTIST',
+			ALBUM			=>	'ALBUM',
+			ALBUMARTIST		=>	'ALBUM ARTIST',
+			TITLE			=>	'TITLE',
+			DATE			=>	'YEAR',
+			TRACKNUMBER		=>	'TRACK',
+			TRACKSTOTAL		=>	'/TRACK',
+			DISCNUMBER		=>	'DISC',
+			DISCSTOTAL		=>	'/DISC'
 		}
 	},
 
@@ -231,7 +255,7 @@ my %codecs = (
 # - impossible de mettre la main sur les sources
 # Bugs :
 # - ne sait pas compresser des fichiers WAV avec plus de deux canaux
-# - ne sait pas compresser des fichiers WAV cadencé à plus de 48 kHz
+# - ne sait pas compresser des fichiers WAV cadencés à plus de 48 kHz
 # - ne sait pas compresser des fichiers WAV avec plus de 16 bits par échantillon
 # Le script essaiera de rééchantillonner les fichiers s'il trouve sox
 # Note : le décodeur est le SV8, pour éviter les incompatibilités. Mais le SV7
@@ -239,22 +263,23 @@ my %codecs = (
 	'mpc'	=>	{
 		enc_bin			=>	"mppenc",
 		enc_opts		=>	"--insane --overwrite",
-		enc_verb_opt	=>	"--verbose",
 		enc_tags_opts	=>	"--tag",
+		enc_verb_opt	=>	"--verbose",
+		enc_vol_opt		=>	"--scale",
 		dec_bin			=>	"mpcdec",
 		dec_tag_sub		=>	\&extract_APE_tags,
-		rg_bin			=>	"replaygain",
-		rg_opts			=>	"--auto",
+		rpg_bin			=>	"replaygain",
+		rpg_opts			=>	"--auto",
 		tags			=>	{
-			artist			=>	'ARTIST',
-			album			=>	'ALBUM',
-			albumartist		=>	'ALBUM ARTIST',
-			title			=>	'TITLE',
-			date			=>	'YEAR',
-			track_number	=>	'TRACK',
-			tracks_total	=>	'/TRACK',
-			disc_number		=>	'DISC',
-			discs_total		=>	'/DISC'
+			ARTIST			=>	'ARTIST',
+			ALBUM			=>	'ALBUM',
+			ALBUMARTIST		=>	'ALBUM ARTIST',
+			TITLE			=>	'TITLE',
+			DATE			=>	'YEAR',
+			TRACKNUMBER		=>	'TRACK',
+			TRACKSTOTAL		=>	'/TRACK',
+			DISCNUMBER		=>	'DISC',
+			DISCSTOTAL		=>	'/DISC'
 		}
 	},
 
@@ -268,15 +293,15 @@ my %codecs = (
 		dec_tag_sub		=>	\&extract_APE_tags,
 		ext				=>	"wv",
 		tags			=>	{
-			artist			=>	'ARTIST',
-			album			=>	'ALBUM',
-			albumartist		=>	'ALBUM ARTIST',
-			title			=>	'TITLE',
-			date			=>	'YEAR',
-			track_number	=>	'TRACK',
-			tracks_total	=>	'/TRACK',
-			disc_number		=>	'DISC',
-			discs_total		=>	'/DISC'
+			ARTIST			=>	'ARTIST',
+			ALBUM			=>	'ALBUM',
+			ALBUMARTIST		=>	'ALBUM ARTIST',
+			TITLE			=>	'TITLE',
+			DATE			=>	'YEAR',
+			TRACKNUMBER		=>	'TRACK',
+			TRACKSTOTAL		=>	'/TRACK',
+			DISCNUMBER		=>	'DISC',
+			DISCSTOTAL		=>	'/DISC'
 		}
 	},
 
@@ -285,16 +310,6 @@ my %codecs = (
 	'wav'	=>	{
 		enc_bin			=>	"true",
 		dec_bin			=>	"true",
-		#~ tags			=>	{
-			#~ artist			=>	'ARTIST',
-			#~ album			=>	'ALBUM',
-			#~ title			=>	'TITLE',
-			#~ date			=>	'DATE',
-			#~ track_number	=>	'TRACKNUMBER',
-			#~ tracks_total	=>	'TRACKTOTAL',
-			#~ disc_number		=>	'DISCNUMBER',
-			#~ discs_total		=>	'DISCTOTAL'
-		#~ }
 		ext				=>	"wav"
 	}
 );
@@ -315,21 +330,21 @@ my $split_verb_opts = "-v";
 my $split_info_opts = "";
 
 # Exécutable et options pour la lecture des tags dans un fichier CUE
+# /!\ ne pas changer la "quotation" des commandes cueprint !
 my $cueprint_bin = chem_bin("cueprint");
 my %cueprint_discinfo = (
-	albumartist	 =>	"$cueprint_bin --disc-template \'%P\\n\'",
-	album		 =>	"$cueprint_bin --disc-template \'%T\\n\'",
-	tracks_total =>	"$cueprint_bin --disc-template \'%N\\n\'"
+	ALBUMARTIST	=>	"$cueprint_bin --disc-template \'%P\\n\'",
+	ALBUM		=>	"$cueprint_bin --disc-template \'%T\\n\'",
+	TRACKSTOTAL	=>	"$cueprint_bin --disc-template \'%N\\n\'"
 );
 my %cueprint_trackinfo = (
-	artist		 =>	"$cueprint_bin --track-template \'%p\\n\' --track-number ",
-	title		 =>	"$cueprint_bin --track-template \'%t\\n\' --track-number ",
-	track_number =>	"$cueprint_bin --track-template \'%n\\n\' --track-number ",
+	ARTIST		=>	"$cueprint_bin --track-template \'%p\\n\' --track-number ",
+	TITLE		=>	"$cueprint_bin --track-template \'%t\\n\' --track-number ",
+	TRACKNUMBER	=>	"$cueprint_bin --track-template \'%n\\n\' --track-number ",
 );
 
 # Exécutable et options pour le rééchantillonnage des fichiers WAV
 my $sox_bin = "sox";
-my $sox_v09_opts = "--volume 0.9";
 my $sox_r48_opts = "--rate 48000";
 my $sox_b16_opts = "--bits 16";
 my $sox_verb_opts = "-V4 --show-progress";
@@ -399,12 +414,33 @@ sub sortie_erreur {
 # Lance une commande système, avec affichage ou non.
 # Renvoie 1 si la commande sort en erreur, et rien sinon.
 # Argument attendu : <la commande>
-sub commande {
+sub commande_ok {
 	my $commande = shift;
 	chomp $commande;
 	msg_debug("lancement de la commande $commande");
-	system("$commande") && return;
+	if ( $debug ) {
+		system("set -x && $commande") && return;
+	}
+	else {
+		system("$commande") && return;
+	}
 	return 1;
+}
+
+# Lance une commande système, avec affichage ou non.
+# Renvoie la sortie de la commande
+# - sous forme scalaire si elle tient sur une ligne
+# - sous forme de tableau sinon
+# Argument attendu : <la commande>
+sub commande_res {
+	my $commande = shift;
+	chomp $commande;
+	$commande .= " 2>&1";
+	msg_debug("lancement de la commande $commande");
+	my @result = `$commande`;
+	@result = `set -x && $commande` if ( $debug );
+	return join("\n", @result) if ( scalar(@result) < 2 );
+	return @result;
 }
 
 # Copie depuis https://perlmaven.com/unique-values-in-an-array-in-perl
@@ -621,10 +657,11 @@ sub recup_cue {
 	return "$cue" if ( -f "$cue" );
 
 	# Sinon, on ne peut plus faire grand-chose...
-	sortie_erreur
+	msg_attention
 		("impossible de trouver un fichier .CUE.".
 		" Soit il n'y en a pas, soit il y en a plusieurs,".
 		" dont aucun avec un nom facilement detectable");
+	return "__nocue__";
 }
 
 # Décompression du ou des fichiers sources
@@ -691,7 +728,7 @@ sub decompress_fic {
 
 	# Les paramètres par défaut doivent être placés en dernier, car, selon
 	# les codecs, le nom du fichier destination doit être ajouté juste après.
-	$ldec_opts .= "$fmt_src{dec_opts}" if ( defined $fmt_src{dec_opts} );
+	$ldec_opts .= " $fmt_src{dec_opts}" if ( defined $fmt_src{dec_opts} );
 	msg_debug("options de la commande : \"$ldec_opts\"");
 
 	# Nom du fichier wav
@@ -733,7 +770,7 @@ sub decompress_fic {
 	# FLAC
 	if ( "$fmt_src" eq "flac" ) {
 		# Décompression du fichier
-		commande("'$dec_bin' $ldec_opts \"$fic_cps\"")
+		commande_ok("'$dec_bin' $ldec_opts \"$fic_cps\"")
 			or sortie_erreur("impossible de décompresser le fichier $fic_cps");
 
 		# Extraction des tags
@@ -748,6 +785,7 @@ sub decompress_fic {
 			foreach my $tag (@tmptags) {
 				chomp $tag;
 				msg_debug(" -FLACTAG- $tag");
+
 				foreach my $typetag ( keys %{$fmt_src{tags}} ) {
 					if ( $tag =~ /^$fmt_src{tags}{$typetag}=/ )	{
 						$tags{$typetag} = (split (/\=/, $tag))[1];
@@ -760,7 +798,7 @@ sub decompress_fic {
 	# Wavpack
 	elsif ( "$fmt_src" eq "wv" ) {
 		# Décompression du fichier
-		commande("'$dec_bin' $ldec_opts \"$fic_cps\"")
+		commande_ok("'$dec_bin' $ldec_opts \"$fic_cps\"")
 			or sortie_erreur("impossible de décompresser le fichier $fic_cps");
 
 		# Extraction des tags
@@ -772,7 +810,7 @@ sub decompress_fic {
 	# Monkey audio
 	elsif ( "$fmt_src" eq "ape" ) {
 		# Décompression du fichier
-		commande("'$dec_bin' \"$fic_cps\" \"$fic_wav\" $ldec_opts")
+		commande_ok("'$dec_bin' \"$fic_cps\" \"$fic_wav\" $ldec_opts")
 			or sortie_erreur("impossible de décompresser le fichier $fic_cps");
 
 		# Extraction des tags
@@ -784,51 +822,75 @@ sub decompress_fic {
 	# Musepack
 	elsif ( ( "$fmt_src" eq "mpc" )	|| ( "$fmt_src" eq "mpc8" ) ) {
 		# Décompression du fichier
-		commande("'$dec_bin' $ldec_opts \"$fic_cps\" \"$fic_wav\"")
+		commande_ok("'$dec_bin' $ldec_opts \"$fic_cps\" \"$fic_wav\"")
 			or sortie_erreur("impossible de décompresser le fichier $fic_cps");
 
 		# Extraction des tags
 		if ( ( defined $ltag_bin ) && ( %{$fmt_src{tags}} ) ) {
 			msg_debug("extraction des tags");
 			%tags = $ltag_bin->("$fic_cps");
-			extract_MPC_infos("$fic_cps");
+			#~ extract_MPC_infos("$fic_cps");
 		}
 	}
+	#~ archive_fic("$fic_cps") if ( $archive );
 	suppr_fic("$fic_cps") if ( $empty );
 
 	# Traitement des tags
+	# Note : les tags globaux seront choisis en priorité
 	if ( ( defined $ltag_bin ) && ( %{$fmt_src{tags}} ) ) {
 
 		# Mise en forme de la date
-		if ( ( defined $tags{date} ) && ( $tags{date} =~ /^[0-9]+\-/ ) ) {
-			$tags{date} = (split (/\-/, $tags{date}))[0];
+		if ( defined $gtags{DATE} ) {
+			$tags{DATE} = $gtags{DATE};
+		}
+		else {
+			if ( ( defined $tags{DATE} ) && ( $tags{DATE} =~ /^[0-9]+\-/ ) ) {
+				$tags{DATE} = (split (/\-/, $tags{DATE}))[0];
+			}
 		}
 
 		# Mise en forme des numéros de disques
-		if ( defined $tags{discs_total} ) {
-			if ( $tags{discs_total} > 1 ) {
-				$tags{disc_number} = sprintf ("%02d", $tags{disc_number})
-					if ( defined $tags{disc_number} );
-				$tags{discs_total} = sprintf ("%02d", $tags{discs_total});
-			}
-			else {
-				undef $tags{discs_total};
-				undef $tags{disc_number} if ( defined $tags{disc_number} );
+		if ( ( defined $gtags{DISCNUMBER} )
+			&& ( defined $gtags{DISCSTOTAL} ) ) {
+			$tags{DISCNUMBER} = $gtags{DISCNUMBER};
+			$tags{DISCSTOTAL} = $gtags{DISCSTOTAL};
+		}
+		else {
+			if ( defined $tags{DISCSTOTAL} ) {
+				if ( $tags{DISCSTOTAL} > 1 ) {
+					$tags{DISCNUMBER} = sprintf ("%02d", $tags{DISCNUMBER})
+						if ( defined $tags{DISCNUMBER} );
+					$tags{DISCSTOTAL} = sprintf ("%02d", $tags{DISCSTOTAL});
+				}
+				else {
+					undef $tags{DISCSTOTAL};
+					undef $tags{DISCNUMBER} if ( defined $tags{DISCNUMBER} );
+				}
 			}
 		}
 
 		# Mise en forme des numéros de morceau
-		$tags{tracks_total} = sprintf ("%02d", $tags{tracks_total})
-			if ( defined $tags{tracks_total} );
-		$tags{track_number} = sprintf ("%02d", $tags{track_number})
-			if ( defined $tags{track_number} );
+		if ( ( defined $gtags{TRACKNUMBER} )
+			&& ( defined $gtags{TRACKSTOTAL} ) ) {
+			$tags{DISCNUMBER} = $gtags{TRACKNUMBER};
+			$tags{DISCSTOTAL} = $gtags{TRACKSTOTAL};
+		}
+		else {
+			$tags{TRACKSTOTAL} = sprintf ("%02d", $tags{TRACKSTOTAL})
+				if ( defined $tags{TRACKSTOTAL} );
+			$tags{TRACKNUMBER} = sprintf ("%02d", $tags{TRACKNUMBER})
+				if ( defined $tags{TRACKNUMBER} );
+		}
+
+		# Mise à jour des tags globaux
+		maj_gtags(%tags);
 
 		# Écriture du fichier tag (enfin !)
 		open (FTAG, ">$fic_tag")
 			or sortie_erreur("impossible d'écrire le fichier $fic_tag");
 
 		# Nom original du fichier
-		print FTAG "nom=$fic_orig\n";
+		print FTAG "NOM=$fic_orig\n";
 		foreach my $tag ( keys %tags ) {
 			if ( defined $tags{$tag} ) {
 				msg_debug(" -FICTAG- $tag=$tags{$tag}");
@@ -859,26 +921,26 @@ sub extract_APE_tags {
 		chomp $typetag;
 
 		# Il faut traiter ces tags à part
-		next if ( $typetag eq "discs_total" );
-		next if ( $typetag eq "tracks_total" );
+		next if ( $typetag eq "DISCSTOTAL" );
+		next if ( $typetag eq "TRACKSTOTAL" );
 
 		# Simplification des correspondances
 		$tags{$typetag} = $$mpcTags{uc($fmt_src{tags}{$typetag})};
 
 		# Traitement à part
 		if ( defined $tags{$typetag} ) {
-			if ( $typetag eq "disc_number" ) {
+			if ( $typetag eq "DISCNUMBER" ) {
 				if ( $tags{$typetag} =~ /^[0-9]+\/[0-9]+$/ ) {
-					($tags{disc_number}, $tags{discs_total}) =
-						split (/\//, $tags{disc_number});
-					msg_debug(" -TAG- discs_total=$tags{discs_total}");
+					($tags{DISCNUMBER}, $tags{DISCSTOTAL}) =
+						split (/\//, $tags{DISCNUMBER});
+					msg_debug(" -TAG- DISCSTOTAL=$tags{DISCSTOTAL}");
 				}
 			}
-			if ( $typetag eq "track_number" ) {
+			if ( $typetag eq "TRACKNUMBER" ) {
 				if ( $tags{$typetag} =~ /^[0-9]+\/[0-9]+$/ ) {
-					($tags{track_number}, $tags{tracks_total}) =
-						split (/\//, $tags{track_number});
-					msg_debug(" -TAG- tracks_total=$tags{tracks_total}");
+					($tags{TRACKNUMBER}, $tags{TRACKSTOTAL}) =
+						split (/\//, $tags{TRACKNUMBER});
+					msg_debug(" -TAG- TRACKSTOTAL=$tags{TRACKSTOTAL}");
 				}
 			}
 			msg_debug(" -TAG- $typetag=$tags{$typetag}")
@@ -886,6 +948,41 @@ sub extract_APE_tags {
 		}
 	}
 	return %tags;
+}
+
+# Mise à jour des tags globaux (%gtags) avec les informations fournies
+# Ne renvoie rien
+# Argument attendu : <un hash de tags>
+sub maj_gtags {
+	my %tmptags = @_;
+	foreach my $gtag (@def_tags) {
+		# Ces tags n'ont rien de "global"
+		next if ( $gtag eq "TITLE" );
+		next if ( $gtag eq "TRACKNUMBER" );
+		# Celui-ci est particulier
+		if ( $gtag eq "ARTIST" ) {
+			next if ( defined $gtags{"ALBUMARTIST"} );
+		}
+		# Règle générale
+		next if ( defined $gtags{$gtag} );
+		next if ( ! defined $tmptags{$gtag} );
+		# Et si après tout ça, on est encore là,
+		# c'est qu'il y a un tag à définir
+		$gtags{$gtag} = $tmptags{$gtag};
+		$gtags{TRACKSTOTAL} = sprintf ("%02d", $gtags{TRACKSTOTAL})
+			if ( $gtag eq "TRACKSTOTAL" );
+		$gtags{DISCNUMBER} = sprintf ("%02d", $gtags{DISCNUMBER})
+			if ( $gtag eq "DISCNUMBER" );
+		$gtags{DISCSTOTAL} = sprintf ("%02d", $gtags{DISCSTOTAL})
+			if ( $gtag eq "DISCSTOTAL" );
+
+		msg_debug(" -GLOBALTAG-MAJ- $gtag = $gtags{$gtag}");
+	}
+
+	foreach my $afftag ( keys %gtags ) {
+		msg_debug(" -GLOBALTAG- $afftag = $gtags{$afftag}");
+	}
+	return;
 }
 
 # Extraction des infos d'un fichier MPC.
@@ -899,7 +996,6 @@ sub extract_MPC_infos {
 	my $mpc_infos = $mpc->info();
 
 	foreach my $dt ( keys %$mpc_infos ) {
-		#~ next if ( $dt =~ /^COVER /);	# image
 		msg_debug(" -MPCINFO- $dt=$$mpc_infos{$dt}");
 	}
 }
@@ -929,7 +1025,7 @@ sub split_wav {
 	msg_debug("options de la commande : \"$split_opts\"");
 
 	# Lancement de la commande
-	commande("\"$split_bin\" $split_opts".
+	commande_ok("\"$split_bin\" $split_opts".
 		" \"$fic_wav\" \"$fic_cue\" \"$base_fic_split\"")
 		or sortie_erreur("impossible de découper le fichier $fic_wav");
 	suppr_fic("$fic_wav");
@@ -939,60 +1035,84 @@ sub split_wav {
 	$fic_tag =~ s/\.[^.]+$/\.tag/;
 	msg_debug("fichier contenant les tags : $fic_tag") if ( -f "$fic_tag" );
 
-	# TODO : on récupère les tags depuis le fichier CUE
-	# mais rien depuis le fichier .tag... Est-ce bien raisonnable ?
-
 	# Récupération des tags "disque"
+	# Note : les tags globaux seront choisis en priorité
 	my %wav_tags;
 	msg_debug("récupération des tags disque");
+
+	# Protection des simples quotes dans le nom du fichier
+	# parce que bash surinterprète, comme d'hab...
+	# /!\ ne pas changer la "quotation" des commandes cueprint !
+	my $tfcue = $fic_cue;
+	$tfcue =~ s/\'/\'\"\'\"\'/g;
+
 	foreach my $tag ( keys %cueprint_discinfo ) {
-		$wav_tags{$tag} = `$cueprint_discinfo{$tag} '$fic_cue'`;
-		sortie_erreur
-			("impossible de récupérer le tag $tag du fichier $fic_cue")
-			unless ( $? == 0 );
-		chomp $wav_tags{$tag};
-		msg_debug(" -CUETAG- $tag=$wav_tags{$tag}");
+		if ( defined $gtags{$tag} ) {
+			$wav_tags{$tag} = $gtags{$tag};
+		}
+		else {
+			# /!\ ne pas changer la "quotation" des commandes cueprint !
+			$wav_tags{$tag} = commande_res
+				("$cueprint_discinfo{$tag} '$tfcue'");
+			chomp $wav_tags{$tag};
+			msg_debug(" -CUETAG- $tag=$wav_tags{$tag}");
+		}
+	}
+	# Il manque les tags DISCNUMBER et DISCSTOTAL
+	if ( ( defined $gtags{DISCNUMBER} )	&& ( defined $gtags{DISCSTOTAL} ) ) {
+		$wav_tags{DISCNUMBER} = $gtags{DISCNUMBER};
+		$wav_tags{DISCSTOTAL} = $gtags{DISCSTOTAL};
 	}
 
 	# Date
-	open (CUE, "<$fic_cue")
-		or sortie_erreur("impossible de lire le fichier $fic_cue");
-	foreach my $ligne (<CUE>) {
-		chomp $ligne;
-		next unless ( $ligne =~ /DATE / );
-		$wav_tags{date} = (split (/ /, $ligne))[-1];
-		last;
+	if ( defined $gtags{DATE} ) {
+		$wav_tags{DATE} = $gtags{DATE};
 	}
-	close CUE;
-	msg_debug(" -CUETAG- date=$wav_tags{date}");
+	else {
+		open (CUE, "<$fic_cue")
+			or sortie_erreur("impossible de lire le fichier $fic_cue");
+		foreach my $ligne (<CUE>) {
+			chomp $ligne;
+			next unless ( $ligne =~ /DATE / );
+			$wav_tags{DATE} = (split (/ /, $ligne))[-1];
+			last;
+		}
+		close CUE;
+		if ( defined $wav_tags{DATE} ) {
+			msg_debug(" -CUETAG- DATE=$wav_tags{DATE}");
+		}
+		else {
+			msg_attention("le champ DATE est vide");
+		}
+	}
 
-	# Les actions à entreprendre pour la conservation des tags
-	# vont-elles dépendre du format ?
-	for (my $num = 1; $num <= $wav_tags{tracks_total}; $num++) {
+	# Mise à jour des tags globaux
+	maj_gtags(%wav_tags);
+
+	# Récupération des tags "morceau"
+	for (my $num = 1; $num <= $wav_tags{TRACKSTOTAL}; $num++) {
 		my $snum = sprintf ("%02d", $num);
 
 		# Nom du fichier
 		my $sfic = "$base_fic_split"."$snum";
 		msg_debug("traitement du fichier $sfic.wav");
 
-		# Récupération des tags "morceau"
+		# Là, on n'a pas le choix, il faut faire confiance au CUE
 		my %ttags;
 		foreach my $tag ( keys %cueprint_trackinfo ) {
-			$ttags{$tag} = `$cueprint_trackinfo{$tag} '$snum' '$fic_cue'`;
-			sortie_erreur
-				("impossible de récupérer le tag $tag du fichier $fic_cue")
-				unless ( $? == 0 );
+			# /!\ ne pas changer la "quotation" des commandes cueprint !
+			$ttags{$tag} = commande_res
+				("$cueprint_trackinfo{$tag} '$snum' '$tfcue'");
 			chomp $ttags{$tag};
 			msg_debug(" -CUETAG- $tag=$ttags{$tag}");
 		}
 
-		# Numéro
-		msg_debug(" -CUETAG- track_number=$snum");
+		# Mise à jour des tags globaux
+		maj_gtags(%ttags);
 
 		# Écriture du fichier tag
 		open (STAG, ">$sfic.tag")
 			or sortie_erreur("impossible d'écrire le fichier $sfic.tag");
-		print STAG "track_number=$snum\n";
 		foreach my $tag ( keys %ttags ) {
 			print STAG "$tag=$ttags{$tag}\n";
 		}
@@ -1004,6 +1124,97 @@ sub split_wav {
 	suppr_fic("$fic_tag");
 }
 
+# Déplace les fichiers SOURCE et CUE dans un répertoire archive ./SRC/
+# et renomme ces fichiers "ARTIST - ALBULM.ext" si les tags globaux existent
+# Arguments attendus : aucun
+sub archive_src {
+	msg_info("déplacement des fichiers source dans le répertoire archive");
+
+	# On doit déjà avoir tout ça, mais bon...
+	my $rep_src = $fic_src;
+	$rep_src = dirname $fic_src if ( -f $fic_src );
+	my $bn_fic_src = basename $fic_src;
+	# Extension
+	my $fext = $fmt_src;
+	$fext = $fmt_src{ext} if ( defined $fmt_src{ext} );
+
+	unless ( ( -d "$rep_src/SRC" ) || ( $debug ) ) {
+		make_path("$rep_src/SRC", { mode => 0755 });
+	}
+	# Est-ce qu'on peut renommer les fichiers ?
+	if ( ( defined $gtags{ALBUMARTIST} ) && ( defined $gtags{ALBUM} ) ) {
+		my $nsrc = "$gtags{ALBUMARTIST} - $gtags{ALBUM}";
+
+		# On ajoute le numéro de disque si nécessaire
+		if ( ( defined $gtags{DISCNUMBER} )
+			&& ( defined $gtags{DISCSTOTAL} )
+			&& ( $gtags{DISCSTOTAL} > 1 ) ) {
+			$nsrc .= " CD$gtags{DISCNUMBER}";
+		}
+
+		# Pour éviter les aller-retours continuels en mode debug
+		msg_debug("$fic_src -> $rep_src/SRC/$nsrc.$fext");
+		move("$fic_src", "$rep_src/SRC/$nsrc.$fext") unless ( $debug );
+		msg_debug("$fic_cue -> $rep_src/SRC/$nsrc.m3u");
+		move("$fic_cue", "$rep_src/SRC/$nsrc.cue") unless ( $debug );
+		return;
+	}
+	# Sinon...
+	msg_debug(" -> $rep_src/SRC/");
+	move("$fic_src", "$rep_src/SRC/") unless ( $debug );
+	move("$fic_cue", "$rep_src/SRC/") unless ( $debug );
+	return;
+}
+
+# Déplace un fichier dans un répertoire archive ./SRC/
+# Ne renvoie rien
+# Argument attendu : <le chemin du fichier>
+#~ sub archive_fic {
+	#~ my $chemin = shift;
+
+	#~ my $rep_src;
+	#~ if ( -f $chemin ) {
+		#~ $rep_src = dirname $chemin;
+	#~ }
+	#~ else {
+		#~ sortie_erreur("$chemin n'existe pas, ou n'est pas un fichier");
+	#~ }
+	#~ msg_info("archivage du fichier $chemin dans le sous-répertoire SRC/");
+	#~ make_path("$rep_src/SRC", { mode => 0755 }) unless ( -d "$rep_src/SRC" );
+	#~ move("$chemin", "$rep_src/SRC/");
+	#~ return;
+#~ }
+
+# Concatène les fichiers M3U CDXX dans un fichier ALBUM.m3u
+# Ne renvoie rien
+# Argument attendu : <le chemin de la source>
+sub concat_m3u {
+	my $chemin = shift;
+
+	# L'utilisation de la fonction recup_m3u est problématique,
+	# car elle va ignorer le contenu du répertoire dans certains cas
+	my @fics_de_rep = recup_liste_fics("$chemin");
+	my @fics_m3u_cd = sort(grep(/\/CD[0-9]+.m3u$/, @fics_de_rep));
+	return if ( scalar @fics_m3u_cd <= 1 );
+	msg_info("création d'une playlist globale pour l'album");
+
+	# Nom du fichier cible
+	my $fic_m3u_album = "$chemin/aa_global.m3u";
+	$fic_m3u_album = "$chemin/$gtags{ALBUM}.m3u" if ( defined $gtags{ALBUM} );
+	open(M3UG, ">$fic_m3u_album")
+		or sortie_erreur("impossible d'écrire le fichier $fic_m3u_album");
+
+	# Écriture
+	foreach my $fic (@fics_m3u_cd) {
+		open(M3UD, "<$fic")
+			or sortie_erreur("impossible de lire le fichier $fic");
+		print M3UG (<M3UD>);
+		close M3UD;
+	}
+	close M3UG;
+	return;
+}
+
 # Détermine le nom des fichiers M3U à utiliser si besoin
 # et renvoie la liste sous forme de tableau
 # Argument attendu : <le chemin de la source>
@@ -1012,7 +1223,9 @@ sub recup_m3u {
 	my $rep = $chemin;
 	$rep = dirname $chemin if ( -f "$chemin" );
 
-	if ( $src_is_rep == 1 ) {
+	# Si le fichier SOURCE doit être découpé, il faudra de toute façon
+	# créer un fichier M3U tout neuf
+	if ( ( ! $split ) && ( $src_is_rep == 1 ) ) {
 		# Y a-t-il des fichiers M3U dans le répertoire ?
 		my @fics_de_rep = recup_liste_fics("$rep");
 		my @fics_m3u = grep (/\.m3u$/, @fics_de_rep);
@@ -1027,6 +1240,17 @@ sub recup_m3u {
 	}
 
 	# Sinon, il va falloir décider
+	# Essai 1 : les global tags
+	# Si plusieurs disques, M3U = CD$num
+	if ( ( defined $gtags{DISCNUMBER} )
+		&& ( defined $gtags{DISCSTOTAL} )
+		&& ( $gtags{DISCSTOTAL} > 1 ) ) {
+		return "$rep/CD$gtags{DISCNUMBER}.m3u";
+	}
+	# Sinon, M3U = ALBUM
+	return "$rep/$gtags{ALBUM}.m3u" if ( defined $gtags{ALBUM} );
+
+	# Essai 2 : à partir du nom du fichier SOURCE
 	my $fic_m3u = (split (/\//, $chemin))[-1];
 	if ( -d "$chemin" ) {
 		$fic_m3u .= ".m3u";
@@ -1043,7 +1267,7 @@ sub recup_m3u {
 sub ajout_RGtags {
 	my $chemin = shift;
 	msg_info("ajout des tags ReplayGain");
-	msg_debug("cette fonction n'est pas encore prête, et vous non plus :p");
+	#~ msg_debug("cette fonction n'est pas encore prête, et vous non plus :p");
 
 	# Visiblement, le calcul se fait au niveau du répertoire
 	sortie_erreur("$chemin n'est pas un répertoire") unless ( -d "$chemin" );
@@ -1053,38 +1277,144 @@ sub ajout_RGtags {
 	$fext = $fmt_dst{ext} if ( defined $fmt_dst{ext} );
 
 	# Commandes
-	my ($rg_bin, $rg_opts);
-	if ( defined $fmt_dst{rg_bin} ) {
-		$rg_bin = $fmt_dst{rg_bin};
-		$rg_opts = " ";
-		$rg_opts = $fmt_dst{rg_opts} if ( defined $fmt_dst{rg_opts} );
+	my ($rpg_bin, $rpg_opts);
+	if ( defined $fmt_dst{rpg_bin} ) {
+		$rpg_bin = $fmt_dst{rpg_bin};
+		$rpg_opts = " ";
+		$rpg_opts = $fmt_dst{rpg_opts} if ( defined $fmt_dst{rpg_opts} );
 	}
 	else {
 		sortie_erreur("pas de commande RG pour le format $fmt_dst");
 	}
-	msg_debug("utilisation du binaire $rg_bin");
-	msg_debug("options de la commande : \"$rg_opts\"");
+	msg_debug("utilisation du binaire $rpg_bin");
+	msg_debug("options de la commande : \"$rpg_opts\"");
 
 	# Les actions à entreprendre pour la conservation des tags
 	# vont-elles dépendre du format ?
 
 	# Ajout des tags
-	commande("'$rg_bin' $rg_opts \"$chemin\"/*.$fext")
+	commande_ok("'$rpg_bin' $rpg_opts \"$chemin\"/*.$fext")
 		or sortie_erreur("impossible de tagger les fichiers de $chemin");
 
 	# DEBUG
 	# Vérification
-	opendir(REP, "$chemin")
-		or sortie_erreur("impossible de lister les fichiers de $chemin");
+	#~ opendir(REP, "$chemin")
+		#~ or sortie_erreur("impossible de lister les fichiers de $chemin");
 
-	foreach my $fic (readdir(REP)) {
-		next if ( fic_format("$chemin/$fic") ne "$fmt_src" );
-		msg_debug("-RG- $chemin/$fic");
-		commande("'$rg_bin' --show-tag=REPLAYGAIN_TRACK_GAIN \"$chemin/$fic\"");
-		commande("'$rg_bin' --show-tag=REPLAYGAIN_ALBUM_GAIN \"$chemin/$fic\"");
-		msg_debug("-RG-");
-	}
+	#~ foreach my $fic (readdir(REP)) {
+		#~ next if ( fic_format("$chemin/$fic") ne "$fmt_src" );
+		#~ msg_debug("-RG- $chemin/$fic");
+		#~ commande_ok
+			#~ ("'$rpg_bin' --show-tag=REPLAYGAIN_TRACK_GAIN \"$chemin/$fic\"");
+		#~ commande_ok
+			#~ ("'$rpg_bin' --show-tag=REPLAYGAIN_ALBUM_GAIN \"$chemin/$fic\"");
+		#~ msg_debug("-RG-");
+	#~ }
 	# /DEBUG
+}
+
+# Compresse une série de fichiers WAV en FLAC rapide
+# et calcule le niveau de clipping via les tags RaplayGain.
+# Renvoie une valeur comprise entre 0 et 1
+# Arguments attendus : @les fichiers
+sub calcul_clip {
+	my @fics_wav = @_;
+	my @fics_cps;
+
+	msg_info("calcul du niveau de guerre du volume");
+	my ($again, $tgain);
+	my $apeak = 0;
+	my $tpeak = 0;
+	my $tmp_cpt = 0;
+
+	# On ne va pas s'embarrasser avec les options compliquées. Le but, ici,
+	# c'est d'aller le plus vite possible.
+	my $tmp_fmt_dst = "flac";
+	my %tmp_fmt_dst = %{$codecs{$tmp_fmt_dst}};
+	my $tmp_ext = "tmp.flac";
+	my $tmp_enc_bin = chem_bin("$tmp_fmt_dst{enc_bin}");
+	my $tmp_enc_opt = "--fast --force --output-name";
+	my $tmp_rpg_bin = chem_bin("$tmp_fmt_dst{rpg_bin}");
+	my $tmp_rpg_opt	= "$tmp_fmt_dst{rpg_opts}";
+
+	msg_verb("première passe de compression en $tmp_fmt_dst");
+	foreach my $fic_wav ( @fics_wav ) {
+		$tmp_cpt++;
+		msg_debug("traitement du fichier $fic_wav");
+		my $fic_cps = "$fic_wav.$tmp_ext";
+		# Compression du fichier
+		commande_ok("'$tmp_enc_bin' $tmp_enc_opt \"$fic_cps\" \"$fic_wav\"")
+			or sortie_erreur("impossible de compresser le fichier $fic_wav");
+		push(@fics_cps, "$fic_cps");
+	}
+
+	# Ajout des tags
+	msg_verb("calcul du niveau de réduction du volume");
+	my $fichiers;
+	foreach my $fic_cps (@fics_cps) {
+		$fichiers .= " \"$fic_cps\"";
+	}
+	commande_ok("'$tmp_rpg_bin' $tmp_rpg_opt $fichiers")
+		or sortie_erreur("impossible de tagger les fichiers");
+
+	# Récupération des tags
+	# Comme perl s'accomode mal des nombres avec plein de décimales (peak),
+	# on va faire quelques multiplications
+	foreach my $fic_cps (@fics_cps) {
+		# Album peak et album gain. Comme ils sont identiques pour tout
+		# un album, inutile de les recalculer à chaque fois
+		if ( ! defined $apeak ) {
+			my $ap = commande_res
+			  ("'$tmp_rpg_bin' --show-tag=REPLAYGAIN_ALBUM_PEAK \"$fic_cps\"");
+			$ap = (split(/=/, $ap))[1] * 1000000;
+			$apeak = 1 if ( $ap >= 999956.000 );
+		}
+		if ( ! defined $again ) {
+			my $ag = commande_res
+			  ("'$tmp_rpg_bin' --show-tag=REPLAYGAIN_ALBUM_GAIN \"$fic_cps\"");
+			$ag = (split(/=/, $ag))[1];
+			$ag =~ s/ dB$//;
+			$again = abs($ag);
+		}
+		# Track peak et track gain
+		my $tp = commande_res
+			("'$tmp_rpg_bin' --show-tag=REPLAYGAIN_TRACK_PEAK \"$fic_cps\"");
+		my $tg = commande_res
+			("'$tmp_rpg_bin' --show-tag=REPLAYGAIN_TRACK_GAIN \"$fic_cps\"");
+		$tp = (split(/=/, $tp))[1] * 1000000;
+		$tg = (split(/=/, $tg))[1];
+		$tg =~ s/ dB$//;
+
+		msg_debug("-RG- track gain : $tg");
+		msg_debug("-RG- track peak : $tp");
+
+		# Valeurs track max
+		$tpeak++ if ( $tp >= 999956.000 );
+
+		if ( defined $tgain ) {
+			$tgain = abs($tg) if ( abs($tg) > $tgain );
+		}
+		else {
+			$tgain = abs($tg);
+		}
+		# Un peu de ménage...
+		suppr_fic("$fic_cps");
+	}
+	msg_debug("-RG- album gain : $again");
+	msg_debug("-RG- album peak : $apeak");
+	msg_debug("-RG- track gain max : $tgain");
+	msg_debug("-RG- track peak max : $tpeak");
+
+	# Cas 1 : pas de clipping du tout ?
+	# Certains codecs/utilisateurs trichent en écrétant le signal...
+	#~ return "1" if ( ( $apeak == 0 ) && ( $tpeak == 0 ) );
+
+	# Cas 2 : il faut réduire le volume. De combien ?
+	return "0.8"	if ( $tgain > 10 );
+	return "0.85"	if ( $tgain >  8 );
+	return "0.90"	if ( $tgain >  6 );
+	return "0.95"	if ( $tgain >  4 );
+	return "1";
 }
 
 # Compression du ou des fichiers WAV trouvés
@@ -1116,6 +1446,21 @@ sub compress_dest {
 		}
 	}
 
+	# On récupère la liste des fichiers WAV
+	my @fics_wav;
+	foreach my $fic ( recup_liste_fics("$chemin") ) {
+		chomp $fic;
+		next if ( $fic =~ /\.OK$/ );	# Résidus de debugs
+		next if ( fic_format("$fic") ne "wav" );
+		push (@fics_wav, $fic);
+	}
+
+	# Récupération du niveau de réduction à appliquer aux fichiers lossy
+	if ( ( defined $fmt_dst{enc_vol_opt} ) && ( ! $noclip ) ) {
+		$volume = calcul_clip(@fics_wav);
+		msg_info("niveau de réduction calculé : $volume");
+	}
+
 	# On compresse tous les fichiers qui conviennent
 	foreach my $fic ( recup_liste_fics("$chemin") ) {
 		chomp $fic;
@@ -1133,7 +1478,7 @@ sub compress_dest {
 			if ( -f "$fic_tag" ) {
 				open (FTAG, "<$fic_tag")
 					or sortie_erreur("impossible de lire le fichier $fic_tag");
-				$fic_orig = (split(/=/, (grep(/^nom=/, <FTAG>))[0]))[-1];
+				$fic_orig = (split(/=/, (grep(/^NOM=/, <FTAG>))[0]))[-1];
 				close FTAG;
 				chomp $fic_orig ;
 				msg_debug("nom original du fichier $fic : $fic_orig");
@@ -1237,8 +1582,8 @@ sub compress_fic {
 	my $rep_cps = dirname "$fic_wav";
 	my $fic_cps;
 	# Si on a accès aux tags, le nom sera le titre. Parce que voilà.
-	if ( defined $tags{title} ) {
-		my $tmp_fic = "$tags{title}"."\.$fext";
+	if ( defined $tags{TITLE} ) {
+		my $tmp_fic = "$tags{TITLE}"."\.$fext";
 		# Il y a quelques caractères interdits.
 		# Attention, l'ordre des tests est important.
 		$tmp_fic =~ s/\\\$/S/g;
@@ -1265,6 +1610,10 @@ sub compress_fic {
 	# Paramètres donnés par l'utilisateur
 	$lenc_opts .= " $enc_opts" if ( defined $enc_opts );
 
+	# Niveau de réduction du volume
+	$lenc_opts .= " $fmt_dst{enc_vol_opt} $volume"
+		if ( ( defined $fmt_dst{enc_vol_opt} ) && ( $volume ne 1 ) );
+
 	# Les paramètres par défaut doivent être placés en dernier, car, selon
 	# les codecs, le nom du fichier destination doit être ajouté juste après.
 	$lenc_opts .= " $fmt_dst{enc_opts}"	if ( defined $fmt_dst{enc_opts} );
@@ -1285,63 +1634,46 @@ sub compress_fic {
 		}
 
 		# Compression du fichier
-		commande("'$enc_bin' $lenc_opts \"$fic_wav\"")
+		commande_ok("'$enc_bin' $lenc_opts \"$fic_wav\"")
 			or sortie_erreur("impossible de compresser le fichier $fic_wav");
 	}
 
 	# MPC
 	elsif ( ( "$fmt_dst" eq "mpc8" ) || ( "$fmt_dst" eq "mpc" ) ) {
 
-		# Détection des bugs du compresseur _avant_ que ça plante
-		# pour pouvoir afficher un message compréhensible
-		my ($fmt,$long,$f,$cans,$freq,$ops,$ope,$bpe) =
-			extract_WAV_infos("$fic_wav");
-
-		if ( ( $freq > 48000 ) || ( $bpe > 16 ) ) {
-			msg_attention("le format du fichier $fic_wav est incompatible".
-			" avec le codec $fmt_dst.");
-			msg_attention(" fréquence d'échantillonnage : $freq Hz");
-			msg_attention("        bits par échantillon : $bpe");
-			$fic_wav = resample_wav("$fic_wav");
-		}
-
-		if ( $cans > 2 ) {
-			msg_erreur("le format du fichier $fic_wav est incompatible".
-			" avec le codec $fmt_dst.");
-			msg_erreur("cause : nombre de canaux trop élevé ($cans)");
-			sortie_erreur("vous DEVEZ choisir un autre format")
-		}
+		# Rééchantillonnage si nécessaire
+		$fic_wav = resample_wav("$fic_wav");
 
 		# Mise en forme des tags
 		if ( %tags ) {
 			foreach my $tag ( keys %tags ) {
-				next if ( $tag eq "track_number" );
-				next if ( $tag eq "tracks_total" );
-				next if ( $tag eq "disc_number" );
-				next if ( $tag eq "discs_total" );
+				next if ( $tag eq "TRACKNUMBER" );
+				next if ( $tag eq "TRACKSTOTAL" );
+				next if ( $tag eq "DISCNUMBER" );
+				next if ( $tag eq "DISCSTOTAL" );
 				$lenc_opts .= " $fmt_dst{enc_tags_opts} ".
 					"\"$fmt_dst{tags}{$tag}\"=\"$tags{$tag}\"";
 			}
 		}
 		# Numéros de morceaux
-		if ( defined $tags{track_number} ) {
-			$tags{track_number} = "$tags{track_number}/$tags{tracks_total}"
-				if ( defined $tags{tracks_total} );
+		if ( defined $tags{TRACKNUMBER} ) {
+			$tags{TRACKNUMBER} = "$tags{TRACKNUMBER}/$tags{TRACKSTOTAL}"
+				if ( defined $tags{TRACKSTOTAL} );
 			$lenc_opts .= " $fmt_dst{enc_tags_opts}".
-					" $fmt_dst{tags}{track_number}=\"$tags{track_number}\"";
+					" $fmt_dst{tags}{TRACKNUMBER}=\"$tags{TRACKNUMBER}\"";
 		}
 		# Numéros de disques
-		if ( defined $tags{disc_number} ) {
-			$tags{disc_number} = "$tags{disc_number}/$tags{discs_total}"
-				if ( defined $tags{discs_total} );
+		if ( defined $tags{DISCNUMBER} ) {
+			$tags{DISCNUMBER} = "$tags{DISCNUMBER}/$tags{DISCSTOTAL}"
+				if ( defined $tags{DISCSTOTAL} );
 			$lenc_opts .= " $fmt_dst{enc_tags_opts}".
-					" $fmt_dst{tags}{disc_number}=\"$tags{disc_number}\"";
+					" $fmt_dst{tags}{DISCNUMBER}=\"$tags{DISCNUMBER}\"";
 			$lenc_opts .= " $fmt_dst{enc_tags_opts}".
-					" Part=\"$tags{disc_number}\"";
+					" Part=\"$tags{DISCNUMBER}\"";
 		}
 
 		# Compression du fichier
-		commande("'$enc_bin' $lenc_opts \"$fic_wav\" \"$fic_cps\"")
+		commande_ok("'$enc_bin' $lenc_opts \"$fic_wav\" \"$fic_cps\"")
 			or sortie_erreur("impossible de compresser le fichier $fic_wav");
 	}
 
@@ -1352,29 +1684,29 @@ sub compress_fic {
 		$lenc_opts .= " $fmt_dst{enc_tags_opts}";
 		if ( %tags ) {
 			foreach my $tag ( keys %tags ) {
-				next if ( $tag eq "track_number" );
-				next if ( $tag eq "tracks_total" );
-				next if ( $tag eq "disc_number" );
-				next if ( $tag eq "discs_total" );
+				next if ( $tag eq "TRACKNUMBER" );
+				next if ( $tag eq "TRACKSTOTAL" );
+				next if ( $tag eq "DISCNUMBER" );
+				next if ( $tag eq "DISCSTOTAL" );
 				$lenc_opts .= " $fmt_dst{tags}{$tag} \"$tags{$tag}\"";
 			}
 		}
 		# Numéros de morceaux
-		if ( defined $tags{track_number} ) {
-			$tags{track_number} = "$tags{track_number}/$tags{tracks_total}"
-				if ( defined $tags{tracks_total} );
-			$lenc_opts .=
-				" $fmt_dst{tags}{track_number} \"$tags{track_number}\"";
+		if ( defined $tags{TRACKNUMBER} ) {
+			$tags{TRACKNUMBER} = "$tags{TRACKNUMBER}/$tags{TRACKSTOTAL}"
+				if ( defined $tags{TRACKSTOTAL} );
+			$lenc_opts .= " $fmt_dst{enc_tags_opts}".
+					" $fmt_dst{tags}{TRACKNUMBER}=\"$tags{TRACKNUMBER}\"";
 		}
 		# Numéros de disques
-		if ( defined $tags{disc_number} ) {
-			$tags{disc_number} = "$tags{disc_number}/$tags{discs_total}"
-				if ( defined $tags{discs_total} );
-			$lenc_opts .= " $fmt_dst{tags}{disc_number}=\"$tags{disc_number}\"";
+		if ( defined $tags{DISCNUMBER} ) {
+			$tags{DISCNUMBER} = "$tags{DISCNUMBER}/$tags{DISCSTOTAL}"
+				if ( defined $tags{DISCSTOTAL} );
+			$lenc_opts .= " $fmt_dst{tags}{DISCNUMBER}=\"$tags{DISCNUMBER}\"";
 		}
 
 		# Compression du fichier
-		commande("'$enc_bin' $lenc_opts \"$fic_wav\"")
+		commande_ok("'$enc_bin' $lenc_opts \"$fic_wav\"")
 			or sortie_erreur("impossible de compresser le fichier $fic_wav");
 	}
 	msg_info("compression du fichier $fic_wav terminée");
@@ -1418,6 +1750,33 @@ sub extract_WAV_infos {
 sub resample_wav {
 	my $fic_wav = shift;
 
+	# Détection des bugs du compresseur _avant_ que ça plante
+	# pour pouvoir afficher un message compréhensible
+	my ($fmt,$long,$f,$cans,$freq,$ops,$ope,$bpe) =
+		extract_WAV_infos("$fic_wav");
+
+	my $rspl;
+	if ( $cans > 2 ) {
+		msg_erreur("le format du fichier $fic_wav est incompatible".
+		" avec le codec $fmt_dst.");
+		msg_erreur("cause : nombre de canaux trop élevé ($cans)");
+		sortie_erreur("vous DEVEZ choisir un autre format")
+	}
+
+	if ( $freq > 48000 ) {
+		msg_attention("le format du fichier $fic_wav est incompatible".
+		" avec le codec $fmt_dst.") unless ( $rspl );
+		msg_attention(" fréquence d'échantillonnage : $freq Hz");
+		$rspl = 1;
+	}
+	if ( $bpe > 16 ) {
+		msg_attention("le format du fichier $fic_wav est incompatible".
+		" avec le codec $fmt_dst.") unless ( $rspl );
+		msg_attention("        bits par échantillon : $bpe");
+		$rspl = 1;
+	}
+	return "$fic_wav" unless ( $rspl );
+
 	# On tente un rééchantillonnage si on a ce qu'il faut
 	my $sox_bin = chem_bin_ou_continue("sox");
 	if ( $sox_bin ne "__inconnu__" ) {
@@ -1431,7 +1790,6 @@ sub resample_wav {
 
 		# Commande, avec quelles options ?
 		my $cmd = "'$sox_bin'";
-		$cmd .= " $sox_v09_opts";
 		if ( $verbose ) {
 			$cmd .= " $sox_verb_opts";
 		}
@@ -1439,13 +1797,13 @@ sub resample_wav {
 			$cmd .= " $sox_info_opts";
 		}
 		$cmd .= " \"$fic_entree\"";
-		$cmd .= " $sox_r48_opts";
-		$cmd .= " $sox_b16_opts";
+		$cmd .= " $sox_r48_opts" if ( $freq > 48000 );
+		$cmd .= " $sox_b16_opts" if ( $bpe > 16 );
 		$cmd .= " \"$fic_wav\"";
 		$cmd .= " rate";
 		# /Commande. Pfffou, rien que ça.
 
-		commande("$cmd")
+		commande_ok("$cmd")
 			or sortie_erreur
 				("impossible de rééchantillonner le fichier $fic_wav");
 
@@ -1461,53 +1819,86 @@ sub resample_wav {
 # Affichage de l'aide et sortie
 # Arguments attendus : aucun
 sub aide {
-	my $fdec = join(", ", @decformats);
-	my $fenc = join(", ", @encformats);
+  my $fdec = join(", ", @decformats);
+  my $fenc = join(", ", @encformats);
 
-	print <<EOF;
+  print <<EOF;
 
-	$prog v$version
+  $prog v$version
 
-	Usage :
-		$prog -h
-		$prog [ <options> ] SOURCE
+  Usage :
+     $prog -h
+     $prog [ <options> ] SOURCE
 
-	Options :
-		-h|--help
-			affiche cette aide
-		-c|--fic_cue FICHIER
-			indique le nom du fichier CUE (pour découpe d'un album en morceaux)
-			(défaut : selon le nom du fichier source)
-		-D|--debug
-			active le mode debug
-		-e|--empty
-			supprime le fichier SOURCE après la compression
-		-g|--noreplaygain
-			désactive l'ajout des tags ReplayGain
-		-I|--fmt_src FORMAT
-			indique le format des fichiers si FICHIER est un répertoire
-			(défaut : le format le plus représenté, ou $fmt_src)
-		-O|--fmt_dst FORMAT
-			indique le format des fichiers en fin de traitement
-			(défaut : $fmt_dst)
-		-o|--enc_opts "OPTIONS"
-			indique des options supplémentaires à passer à l'encodeur
-			(défaut : selon le format d'encodage choisi)
-		-r|--src_is_rep
-			indique que SOURCE est un répertoire (debug uniquement)
-			(défaut : déterminé automatiquement)
-		-v|--verbose
-			active le mode bavard
+  Options :
+     -h|--help
+        affiche cette aide
 
-	Note :
-		SOURCE est le chemin du fichier ou du répertoire à traiter (obligatoire)
+     -a|--archive
+        déplace les fichiers SOURCE dans un sous-répertoire ./SRC/
+	(défaut : activé par -s)
 
-	Formats acceptés :
-	- en décompression : $fdec
-	- en compression : $fenc
+     -C|--noclip
+        désactive le calcul de la réduction de volume à l'encodage
 
-	Exemples de paramètres à passer à l'encodeur :
-	MP3/MPC : "--scale 0.8"
+     -c|--fic_cue FICHIER
+        indique le chemin du fichier CUE (pour découpe d'un album en morceaux)
+        (défaut : selon le chemin du fichier source)
+        implique -s
+
+     -D|--debug
+        active le mode debug
+
+     -e|--empty
+        supprime le fichier SOURCE après la compression
+
+     -g|--noreplaygain
+        désactive l'ajout des tags ReplayGain
+
+     -I|--fmt_src FORMAT
+        indique le format des fichiers si FICHIER est un répertoire
+        (défaut : le format le plus représenté, ou $fmt_src)
+
+     -O|--fmt_dst FORMAT
+        indique le format des fichiers en fin de traitement
+        (défaut : $fmt_dst)
+
+     -o|--enc_opts "OPTIONS"
+        indique des options supplémentaires à passer à l'encodeur
+        (défaut : selon le format d'encodage choisi)
+
+     -s|--split
+        indique que SOURCE est un fichier album à découper (debug uniquement)
+        nécessite un fichier CUE (voir -c)
+        (défaut : déterminé automatiquement. Mais pas toujours bien !)
+        implique -a
+
+     -t|--tag ARTIST="ARTIST"
+              ALBUM="ALBUM"
+              ALBUMARTIST="ALBUMARTIST"
+              TITLE="TITLE"
+              DATE="YEAR"
+              TRACKNUMBER="NUMBER"
+              TRACKSTOTAL="NUMBER"
+              DISCNUMBER="NUMBER"
+              DISCSTOTAL="NUMBER"
+        ajoute ou remplace les tags correspondants lors de la recompression
+        (défaut : déterminés automatiquement si les fichiers sources
+        sont déjà taggés, ou grâce au fichier CUE si le fichier source doit
+        être découpé)
+
+     -v|--verbose
+        active le mode bavard
+
+     Note :
+        SOURCE est le chemin du fichier ou du répertoire à traiter (obligatoire)
+
+     Formats acceptés :
+        - en décompression : $fdec
+        - en compression : $fenc
+
+     Exemples d'options à passer à l'encodeur :
+        MP3/MPC : "--scale 0.8"
 
 EOF
 	exit 0;
@@ -1517,8 +1908,10 @@ EOF
 ####
 
 ## Traitement des arguments
-my %lconfig;
+my (%lconfig, %cmdtags);
 GetOptions (
+	'a|archive'			=> \$lconfig{archive},
+	'C|noclip'			=> \$lconfig{noclip},
 	'c|fic_cue=s'		=> \$lconfig{fic_cue},
 	'D|debug'			=> \$lconfig{debug},
 	'e|empty'			=> \$lconfig{empty},
@@ -1528,7 +1921,8 @@ GetOptions (
 	'i|dec_opts=s'		=> \$lconfig{dec_opts},
 	'O|fmt_dst=s'		=> \$lconfig{fmt_dst},
 	'o|enc_opts=s'		=> \$lconfig{enc_opts},
-	'r|src_is_rep'		=> \$lconfig{src_is_rep},
+	's|split'			=> \$lconfig{split},
+	't|tag=s'			=> \%cmdtags,
 	'v|verbose'			=> \$lconfig{verbose}
 	)
 or aide();
@@ -1542,21 +1936,59 @@ msg_verb("$prog v$version");
 
 # Fichier source
 aide() unless ( defined $ARGV[0] );
-$fic_src = $ARGV[0];
-$empty = 1 if ( defined $lconfig{empty} );
+$fic_src = File::Spec->rel2abs("$ARGV[0]");
+$src_is_rep = fic_ou_rep("$fic_src");
 
-# Fichier ou répertoire ?
-if ( defined $lconfig{src_is_rep} ) {
-	$src_is_rep = 1;
-	msg_verb("$fic_src est un répertoire (option forcée)");
+# Archive ? Suppression ? Mais pas les deux en tout cas !
+if ( defined $lconfig{archive} ) {
+	$archive = 1;
+	if ( defined $lconfig{empty} ) {
+		msg_attention("les options -a et -e ne peuvent pas cohabiter");
+		msg_attention("par sécurité, seul -a est retenu");
+	}
 }
 else {
-	$src_is_rep = fic_ou_rep("$fic_src");
+	$empty = 1 if ( defined $lconfig{empty} );
 }
-$fic_src = File::Spec->rel2abs("$fic_src");
+
+# Fichier .CUE ?
+if ( defined $lconfig{fic_cue} ) {
+	sortie_erreur("l'option -c est activée, mais $fic_src est un répertoire")
+		if ( $src_is_rep == 1 );
+	$fic_cue = fic_ou_rep("$lconfig{fic_cue}");
+	add_nl("$fic_cue");
+	$split = 1;
+	msg_verb("fichier CUE donné : $fic_cue (option forcée)");
+}
+
+# Fichier à découper ?
+if ( defined $lconfig{split} ) {
+	sortie_erreur("l'option -c est activée, mais $fic_src est un répertoire")
+		if ( $src_is_rep == 1 );
+	$split = 1;
+	msg_verb("$fic_src est un album à découper (option forcée)");
+}
+else {
+	if ( $src_is_rep == 0 ) {
+		$fic_cue = recup_cue("$fic_src");
+		if ( $fic_cue eq "__nocue__" ) {
+			msg_attention("$fic_src ne sera pas découpé");
+		}
+		else {
+			msg_verb("$fic_src est un album à découper");
+			msg_verb("fichier CUE trouvé : $fic_cue");
+			add_nl("$fic_cue");
+			$split = 1;
+		}
+	}
+}
+if ( $split ) {
+	$split_bin = chem_bin("$split_bin");
+	$archive = 1;
+}
 
 # DEBUG - test de fonction
-#~ nom_m3u("$fic_src");
+#~ archive_src;
 #~ exit 0;
 # /DEBUG
 
@@ -1588,31 +2020,32 @@ sortie_erreur("le format de sortie $fmt_dst n'est pas pris en charge")
 %fmt_dst = %{$codecs{$fmt_dst}};
 $enc_bin = chem_bin("$fmt_dst{enc_bin}");
 
-# Fichier .CUE ?
-# Par définition, n'est utile que dans le cas d'un album non découpé, et donc
-# lorsqu'on donne un fichier, et pas un répertoire, à traiter au script.
-if ( $src_is_rep == 0 ) {
-	if ( defined $lconfig{fic_cue} ) {
-		$fic_cue = fic_ou_rep("$lconfig{fic_cue}");
-		msg_verb("fichier CUE donné : $fic_cue (option forcée)");
+# Gestion des arguments tags
+if ( scalar(keys %cmdtags) > 0 ) {
+	# Conversion de toutes les clefs en MAJUSCULES
+	foreach my $clef ( keys %cmdtags ) {
+		my $uclef = uc($clef);
+		# Si c'est déjà bon, on supprime le tag...
+		next if ( $uclef eq $clef );
+		$cmdtags{$uclef} = $cmdtags{$clef};
+		undef $cmdtags{$clef};
 	}
-	else {
-		$fic_cue = recup_cue("$fic_src");
-		msg_verb("fichier CUE trouvé : $fic_cue");
-	}
-	add_nl("$fic_cue");
-	$split_bin = chem_bin("$split_bin");
+	# Mise à jour des tags globaux
+	maj_gtags(%cmdtags);
 }
 
 # Options supplémentaires
 $dec_opts = $lconfig{dec_opts} if ( defined $lconfig{dec_opts} );
 $enc_opts = $lconfig{enc_opts} if ( defined $lconfig{enc_opts} );
 
-# Désactivation des ajouts ReplayGain
-#~ $noreplaygain = $lconfig{noreplaygain} if ( defined $lconfig{noreplaygain} );
-$noreplaygain = 1 unless ( $debug );
+# Désactivation du calcul anti-clipping
+$noclip = $lconfig{noclip} if ( defined $lconfig{noclip} );
 
-# Arrivé ici, tout les arguments ont été traités, on peut commencer
+# Désactivation des ajouts ReplayGain
+$noreplaygain = $lconfig{noreplaygain} if ( defined $lconfig{noreplaygain} );
+
+## /Arguments
+# Maintenant, on peut commencer
 my $fic_wav = decompress_src("$fic_src");
 
 # Dirname. Ça servira par la suite
@@ -1620,7 +2053,10 @@ my $rep_wav = $fic_wav;
 $rep_wav = dirname $fic_wav if ( -f "$fic_wav" );
 
 # Découpage du fichier si besoin
-split_wav("$fic_wav") if ( $src_is_rep == 0 );
+split_wav("$fic_wav") if ( $split );
+
+# Archivage si besoin
+archive_src() if ( $archive );
 
 # Et, arrivé ici, on a des fichiers WAV séparés, un par morceau
 # Reste plus qu'à recompresser dans le format voulu
@@ -1630,7 +2066,11 @@ compress_dest("$rep_wav");
 # Ajout des tags ReplayGain, éventuellement
 ajout_RGtags("$rep_wav") unless ( $noreplaygain );
 
-# Fin de la fin
+# Et le petit plus pour la fin : la concaténation de playlists
+# pour les albums multi-disques
+concat_m3u("$rep_wav");
+
+## Fin de la fin
 msg_info("mission accomplie :)");
 print "\n";
 exit 0;
