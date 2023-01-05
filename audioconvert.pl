@@ -42,14 +42,20 @@
 #	- correction de bugs sur l'option -c
 #	- correction de bugs en cas de non-(dé)compression (WAV)
 #	- un peu de nettoyage des bouts de code devenus inutiles
+# 0.8.1 :
+#	- conversion utf-8 de tous les tags et des messages
+#	- extraction du CUE intégré des fichiers wavpack
 #
 ###
 #
-# CNE - 20200424
+# CNE - 20200428
 #
 ###
 use strict;
 use warnings;
+use 5.16.0;
+use utf8;
+#
 use Audio::FLAC::Header;
 use Audio::Musepack;
 #~ use Data::Dumper;
@@ -65,7 +71,7 @@ use MP4::Info;
 use Ogg::Vorbis::Header;
 
 my $prog = basename $0;
-my $version = "0.8";
+my $version = "0.8.1";
 
 # Options par défaut
 my $archive;					# Archivage des fichiers sources dans ./SRC/ ?
@@ -175,7 +181,7 @@ my %codecs = (
 	},
 
 # Monkey's Audio
-# Lossless, mais privateur. Et lent.
+# Lossless, mais privateur. Et leeeeeeeent.
 # En décompression uniquement.
 	'ape'	=>	{
 		dec_tag_sub		=>	\&extract_APE_tags,
@@ -275,7 +281,7 @@ my %codecs = (
 	},
 
 # Musepack SV7
-# Libre. Lossy, mais propre.
+# Libre. Lossy, mais (parait-il) le plus propre.
 # Officiellement obsolète, mais, au moins, la plupart des logiciels compatibles
 # savent à peu près le lire...
 # Problèmes :
@@ -283,6 +289,7 @@ my %codecs = (
 # - tout est compilé en 32 bits
 # - impossible de mettre la main sur les sources
 # - replaygain a besoin de bibliothèques esound (!)
+# - unicode non géré dans les tags
 # Bugs :
 # - ne sait pas compresser des fichiers WAV avec plus de deux canaux
 # - ne sait pas compresser des fichiers WAV cadencés à plus de 48 kHz
@@ -398,7 +405,8 @@ my $enc_bin;
 my $dec_bin	= "ffmpeg";
 my $dec_verb_opt = "-v info";		# verbose, c'est très bavard
 my $dec_info_opt = "-v warning";
-my $dec_def_opts = "-bitexact -acodec pcm_s16le -ar 44100 -y",
+my $dec_def_opts = "-bitexact -acodec pcm_s16le -ar 44100 -y";
+my $dec_cue_opts = "-y -f ffmetadata /dev/null";
 
 # Exécutable et options pour la découpe des fichiers WAV
 my $split_bin = "bchunk";
@@ -414,6 +422,7 @@ my $split_info_opts = "";
 sub msg_info {
 	my $message = shift;
 	chomp $message;
+	utf8::encode($message);
 	print "      INFO : $message\n";
 }
 
@@ -424,6 +433,7 @@ sub msg_debug {
 	my @message = @_ ;
 	foreach my $ligne ( @message ) {
 		chomp $ligne;
+		utf8::encode($ligne);
 		print "     DEBUG : $ligne\n";
 	}
 }
@@ -435,6 +445,7 @@ sub msg_verb {
 	my @message = @_ ;
 	foreach my $ligne ( @message ) {
 		chomp $ligne;
+		utf8::encode($ligne);
 		print "   VERBOSE : $ligne\n";
 	}
 }
@@ -444,6 +455,7 @@ sub msg_verb {
 sub msg_attention {
 	my $message = shift;
 	chomp $message;
+	utf8::encode($message);
 	print " ATTENTION : $message\n";
 }
 
@@ -452,6 +464,7 @@ sub msg_attention {
 sub msg_erreur {
 	my $message = shift;
 	chomp $message;
+	utf8::encode($message);
 	print " !! ERREUR : $message\n";
 }
 
@@ -733,6 +746,13 @@ sub recup_cue {
 	$cue = "$fic.cue";
 	return "$cue" if ( -f "$cue" );
 
+	# Cas particulier : le format wavpack permet d'embarquer les données CUE
+	# _dans_ le fichier SOURCE.
+	if ( "$fmt_src" eq "wavpack" ) {
+		$cue = extract_CUE("$fic");
+		return "$cue" if ( -f "$cue" );
+	}
+
 	# Sinon, on ne peut plus faire grand-chose...
 	msg_attention
 		("impossible de trouver un fichier .CUE.".
@@ -816,7 +836,6 @@ sub decompress_fic {
 	msg_debug("fichier décompressé : $fwav");
 
 	# Extraction des tags si nécessaire, et si possible
-	#~ my (%tags, $fic_tag);
 	if ( ( %{$fmt_src{tags}} ) && ( defined $fmt_src{dec_tag_sub} ) ) {
 		my $fic_tag = $fic_cps;
 		$fic_tag =~ s/\.[^.]+$/\.tag/;
@@ -877,6 +896,7 @@ sub decompress_fic {
 			or sortie_erreur("impossible d'écrire le fichier $fic_tag");
 		foreach my $tag ( keys %tags ) {
 			if ( defined $tags{$tag} ) {
+				utf8::upgrade($tags{$tag});
 				msg_debug(" -FICTAG- $tag=$tags{$tag}");
 				print FTAG "$tag=$tags{$tag}\n";
 			}
@@ -938,6 +958,7 @@ sub extract_MP4_tags {
 
 		# Traitement à part
 		if ( defined $tags{$typetag} ) {
+			utf8::upgrade($tags{$typetag});
 			if ( $typetag eq "DISCNUMBER" ) {
 				($tags{DISCNUMBER}, $tags{DISCSTOTAL}) = @{$tags{$typetag}};
 				msg_debug(" -TAG- DISCSTOTAL=$tags{DISCSTOTAL}");
@@ -983,6 +1004,7 @@ sub extract_APE_tags {
 
 		# Traitement à part
 		if ( defined $tags{$typetag} ) {
+			utf8::upgrade($tags{$typetag});
 			if ( $typetag eq "DISCNUMBER" ) {
 				if ( $tags{$typetag} =~ /^[0-9]+\/[0-9]+$/ ) {
 					($tags{DISCNUMBER}, $tags{DISCSTOTAL}) =
@@ -1025,9 +1047,10 @@ sub extract_FLAC_tags {
 
 		# Simplification des correspondances
 		$tags{$typetag} = $flacTags{uc($fmt_src{tags}{$typetag})};
-
-		msg_debug(" -TAG- $typetag=$tags{$typetag}")
-			if ( defined $tags{$typetag} );
+		if ( defined $tags{$typetag} ) {
+			utf8::upgrade($tags{$typetag});
+			msg_debug(" -TAG- $typetag=$tags{$typetag}");
+		}
 	}
 	return %tags;
 }
@@ -1057,6 +1080,7 @@ sub extract_OGG_tags {
 		foreach my $tag ( @oggTags ) {
 			if ( uc($tag) eq $typetag ) {
 				$tags{$typetag} = join(" ", $ogg->comment($tag));
+				utf8::upgrade($tags{$typetag});
 				msg_debug(" -TAG- $typetag=$tags{$typetag}");
 				next;
 			}
@@ -1115,6 +1139,58 @@ sub extract_MPC_infos {
 	}
 }
 
+# Récupération des informations CUE d'un fichier wavpack
+# Écrit le CUE dans un fichier plat
+# Retourne le nom du fichier CUE
+# Argument attendu : <le chemin du fichier SOURCE>
+sub extract_CUE {
+	my $fic = shift;
+
+	msg_info("tentative de récupération des informations CUE du fichier $fic");
+	my $fcue = $fic;
+	$fcue =~ s/\.[^.]+$/\.cue/;
+
+	# Récupération à partir de la sortie de ffmpeg
+	my @cueinfos;
+	foreach my $ligne ( commande_res("'$dec_bin' -i \"$fic\" $dec_cue_opts") ) {
+		chomp $ligne;
+		if ( scalar(@cueinfos) eq 0 ) {
+			next unless ( uc($ligne) =~ / CUESHEET / );
+			msg_debug("informations CUE trouvées");
+			msg_verb("les informations seront écrites dans $fcue");
+			my $cueinfo = (split(/: /,$ligne))[1];
+			utf8::decode($cueinfo);
+			utf8::upgrade($cueinfo);
+			msg_debug(" -WVCUE- $cueinfo");
+			push (@cueinfos, "$cueinfo");
+		}
+		else {
+			my ($cuetag, $cueinfo) = split(/: /,$ligne);
+			last if ( $cuetag =~ /\w+/ );
+			utf8::decode($cueinfo);
+			utf8::upgrade($cueinfo);
+			msg_debug(" -WVCUE- $cueinfo");
+			push (@cueinfos, "$cueinfo");
+		}
+	}
+
+	# Alors, on a trouvé les infos, ou pas ?
+	if ( scalar(@cueinfos) eq 0 ) {
+		msg_attention("pas d'informations CUE trouvées");
+		return "__nocue__";
+	}
+	open (CUE, ">$fcue")
+		or sortie_erreur("impossible de créer le fichier $fcue");
+	foreach my $ligne ( @cueinfos ) {
+		chomp $ligne;
+		# Suppression des espaces finales, ça perturbe bchunck...
+		$ligne =~ s/\s+$//;
+		print CUE "$ligne\n";
+	}
+	close CUE;
+	return "$fcue";
+}
+
 # Récupération des tags d'un album à partir du fichier CUE
 # Renvoie toutes les valeurs sous forme de hash :
 #	%cuetags => {
@@ -1163,12 +1239,15 @@ sub extract_CUE_infos {
 			$cuetags{ALBUMARTIST} =~ s/^PERFORMER //;
 			$cuetags{ALBUMARTIST} =~ s/\"//g;
 			$cuetags{ARTIST} = $cuetags{ALBUMARTIST};
+			utf8::upgrade($cuetags{ARTIST});
+			utf8::upgrade($cuetags{ALBUMARTIST});
 			next;
 		}
 		if ( $ligne =~ /^TITLE / ) {
 			$cuetags{ALBUM} = $ligne;
 			$cuetags{ALBUM} =~ s/^TITLE //;
 			$cuetags{ALBUM} =~ s/\"//g;
+			utf8::upgrade($cuetags{ALBUM});
 			next;
 		}
 		# Champs relatifs aux morceaux
@@ -1185,12 +1264,14 @@ sub extract_CUE_infos {
 			$cuetags{$numtrack}{ARTIST} = $ligne;
 			$cuetags{$numtrack}{ARTIST} =~ s/^\s+PERFORMER //;
 			$cuetags{$numtrack}{ARTIST} =~ s/\"//g;
+			utf8::upgrade($cuetags{$numtrack}{ARTIST});
 			next;
 		}
 		if ( $ligne =~ /^\s+TITLE / ) {
 			$cuetags{$numtrack}{TITLE} = $ligne;
 			$cuetags{$numtrack}{TITLE} =~ s/^\s+TITLE //;
 			$cuetags{$numtrack}{TITLE} =~ s/\"//g;
+			utf8::upgrade($cuetags{$numtrack}{TITLE});
 			next;
 		}
 		# Le reste, on s'en fiche... Non ? :)
@@ -1906,9 +1987,14 @@ sub compress_fic {
 				next if ( $tag eq "TRACKSTOTAL" );
 				next if ( $tag eq "DISCNUMBER" );
 				next if ( $tag eq "DISCSTOTAL" );
+				# Le binaire SV7 a visiblement été compilé à une époque
+				# où l'unicode était encore un doux rêve...
+				my $isotag = $tags{$tag};
+				utf8::decode($isotag);
 				$lenc_opts .= " $fmt_dst{enc_tags_opts} ".
-					"\"$fmt_dst{tags}{$tag}\"=\"$tags{$tag}\"";
+					"\"$fmt_dst{tags}{$tag}\"=\"$isotag\"";
 			}
+			utf8::encode($fic_cps);
 		}
 		# Numéros de morceaux
 		if ( defined $tags{TRACKNUMBER} ) {
@@ -2077,6 +2163,7 @@ sub aide {
   my $fdec = join(", ", @decformats);
   my $fenc = join(", ", @encformats);
 
+  binmode(STDOUT, ":utf8");
   print <<EOF;
 
   $prog v$version
@@ -2199,6 +2286,25 @@ aide() unless ( defined $ARGV[0] );
 $fic_src = File::Spec->rel2abs("$ARGV[0]");
 $src_is_rep = fic_ou_rep("$fic_src");
 
+# Format source
+if ( defined $lconfig{fmt_src} ) {
+	$fmt_src = int_format("$lconfig{fmt_src}");
+	if ( $src_is_rep == 1 ) {
+		msg_verb("format d'entrée : $fmt_src (option forcée)");
+	}
+	else {
+		msg_verb("$fic_src est un fichier $fmt_src (option forcée)");
+	}
+}
+else {
+	$fmt_src = detect_formats("$fic_src");
+	msg_verb("format d'entrée : $fmt_src");
+}
+sortie_erreur("le format d'entrée $fmt_src n'est pas pris en charge")
+	unless grep(/$fmt_src/, @decformats);
+%fmt_src = %{$codecs{$fmt_src}};
+$dec_bin = chem_bin("$dec_bin");
+
 # Archive ? Suppression ? Mais pas les deux en tout cas !
 if ( defined $lconfig{archive} ) {
 	$archive = 1;
@@ -2249,25 +2355,6 @@ if ( $split ) {
 	$archive = 1;
 }
 
-# Format source
-if ( defined $lconfig{fmt_src} ) {
-	$fmt_src = int_format("$lconfig{fmt_src}");
-	if ( $src_is_rep == 1 ) {
-		msg_verb("format d'entrée : $fmt_src (option forcée)");
-	}
-	else {
-		msg_verb("$fic_src est un fichier $fmt_src (option forcée)");
-	}
-}
-else {
-	$fmt_src = detect_formats("$fic_src");
-	msg_verb("format d'entrée : $fmt_src");
-}
-sortie_erreur("le format d'entrée $fmt_src n'est pas pris en charge")
-	unless grep(/$fmt_src/, @decformats);
-%fmt_src = %{$codecs{$fmt_src}};
-$dec_bin = chem_bin("$dec_bin");
-
 # Format destination
 $fmt_dst = int_format("$lconfig{fmt_dst}")
 	if ( defined $lconfig{fmt_dst} );
@@ -2276,10 +2363,6 @@ sortie_erreur("le format de sortie $fmt_dst n'est pas pris en charge")
 	unless grep(/$fmt_dst/, @encformats);
 %fmt_dst = %{$codecs{$fmt_dst}};
 $enc_bin = chem_bin("$fmt_dst{enc_bin}");
-
-# DEBUG
-#~ exit 0;
-# /DEBUG
 
 # Gestion des arguments tags
 if ( scalar(keys %cmdtags) > 0 ) {
