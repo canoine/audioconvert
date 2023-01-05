@@ -1,24 +1,24 @@
 #!/bin/bash
 
+
 # Quelques variables
+VERSION="0.2a"
 FORMAT_SRC="flac"		# Format des fichiers a traiter
 FORMAT_DEST="mpc"		# Format des fichiers en fin de traitement
 
-APEBIN="mac"
-APEDECOPTS="-d"
-
-FLACBIN="flac"
-FLACDECOPTS="-df"
+APEBIN="mac"			# Monkey audio
+APEDECOPTS="-d"			# Monkey audio (args)
+FLACBIN="flac"			# FLAC
+FLACDECOPTS="-df"		# FLAC (args)
 
 SPLITBIN="bchunk"
 SPLITOPTS="-vw"
 
-MPCENCBIN="mppenc" 		# SV7
-#MPCENCBIN="mpcenc"		# SV8, pas encore supporte...
+MPC7ENCBIN="mppenc" 		# Musepack SV7
+MPC8ENCBIN="mpcenc"		# Musepack SV8, pas encore bien supporte...
 MPCENCOPTS="--verbose --insane --deleteinput --overwrite"
-
-MP3BIN="lame"
-MP3ENCOPTS="-V 3 --vbr-new --brief"
+MP3BIN="lame"				# MP3
+MP3ENCOPTS="-V 3 --vbr-new --brief"	# MP3 (args)
 
 ENCSUPPOPTS=""
 
@@ -30,11 +30,12 @@ function usage () {
 		$O [ -h ] [ -c <options> ] [ -s <format> ] [ -d <format> ] -f fichier
 
 	ou :
-		-s designe le format des fichiers a traiter (defaut : FLAC)
+		-h affiche cette aide
 		-d designe le format des fichiers en fin de traitement	(defaut : MPC)
 		-c designe des options supplementaires a passer a l'encodeur
 		-f designe le fichier ou le retpertoire a traiter (obligatoire)
-		-h affiche cette aide
+		-s designe le format des fichiers a traiter si un repertoire est donne
+		   comme argument a -f (defaut : FLAC)
 
 	Formats acceptes :
 	- en decompression : WAV, FLAC, APE
@@ -52,9 +53,13 @@ function usage () {
 function detect_formats () {
 	# Formats destination
 	case $FORMAT_DEST in
-		MPC|mpc|Mpc|MUSEPACK|Musepack|musepack|MUSE|Muse|muse)
-			echo " *****  Format de sortie : Musepack (MPC)"
-			FORMAT_DEST="mpc"
+		MPC8|mpc8|Mpc8|MUSEPACKv8|Musepackv8|musepackv8|MUSEv8|Musev8|musev8)
+			echo " *****  Format de sortie : Musepack SV8 (MPC)"
+			FORMAT_DEST="mpc8"
+			;;
+		MPC|mpc|Mpc|MUSE*|Muse*|muse*)
+			echo " *****  Format de sortie : Musepack SV7 (MPC)"
+			FORMAT_DEST="mpc7"
 			;;
 		MP3|mp3|Mp3)
 			echo " *****  Format de sortie : MP3"
@@ -147,9 +152,9 @@ function decode_src () {
 
 	FIC_DEC=`echo "$SOURCE" | sed s/\.[a-zA-Z0-9]*$/\.wav/`
 	case $FORMAT_SRC in
-		wav)	mv "$SOURCE" "$FIC_DEC" && echo " *****  Fichier $SOURCE non compresse.";;
-		flac)	$FLACBIN $FLACDECOPTS "$SOURCE"					;;
-		ape)	$APEBIN "$SOURCE" "$FIC_DEC" $APEDECOPTS			;;
+		wav)	echo " *****  Fichier $SOURCE non compresse."	;;
+		flac)	$FLACBIN $FLACDECOPTS "$SOURCE"			;;
+		ape)	$APEBIN "$SOURCE" "$FIC_DEC" $APEDECOPTS	;;
 	esac
 
 	if [ $? -ne 0 ]
@@ -191,10 +196,13 @@ function split_wav () {
 function encode_dest () {
 	ls "$REP_SRC"/*.wav | while read fic
 	do
-	        FIC_ENC=`echo "$fic" | sed s/.wav$/.$FORMAT_DEST/`
 		case $FORMAT_DEST in
-			mpc)	$MPCENCBIN $MPCENCOPTS $BINENCOPTS $ENCSUPPOPTS "$fic" "$FIC_ENC"	;;
-			mp3)	$MP3BIN $MP3ENCOPTS $ENCSUPPOPTS "$fic" "$FIC_ENC" && rm -vf "$fic"	;;
+			mpc7)	FIC_ENC=`echo "$fic" | sed s/.wav$/.mpc/`
+				$MPC7ENCBIN $MPCENCOPTS $BINENCOPTS $ENCSUPPOPTS "$fic" "$FIC_ENC"	;;
+			mpc8)	FIC_ENC=`echo "$fic" | sed s/.wav$/.mpc/`
+				$MPC8ENCBIN $MPCENCOPTS $BINENCOPTS $ENCSUPPOPTS "$fic" "$FIC_ENC"	;;
+			mp3)	FIC_ENC=`echo "$fic" | sed s/.wav$/.mp3/`
+				$MP3BIN $MP3ENCOPTS $ENCSUPPOPTS "$fic" "$FIC_ENC" && rm -vf "$fic"	;;
 		esac
 		if [ $? -ne 0 ]
 		then
@@ -235,3 +243,4 @@ fi
 # separes, un par morceau
 # Reste plus qu'a recompresser dans le format voulu
 encode_dest
+
