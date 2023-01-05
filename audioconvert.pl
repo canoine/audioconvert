@@ -12,49 +12,7 @@
 #
 ###
 #
-# Changelog :
-# 0.6 :
-#	- réécriture complète du script (intialement en shell) en perl
-#	- écriture des tags
-#	- écriture ou réécriture des playlists M3U
-#	- rééchantillonnement des fichiers WAV selon les codecs et
-#		le format des fichiers WAV
-# 0.7 :
-#	- ajout des options -t en ligne de comande
-#	- ajout des tags ReplayGain
-#	- création et utilisation de tags globaux
-#	- détection du clipping et application du niveau de réduction du signal
-#	- option forcée ou non de déplacement des fichiers SOURCE et CUE
-# 		dans un sous-répertoire ./SRC/
-# 0.8 :
-#	- remplacement de cueprint, décidément trop capricieux, par une fonction
-#	- remplacement de metaflac par une fonction pour l'extraction des tags FLAC
-#	- utilisation systématique d'une fonction pour l'extraction des tags
-#	- utilisation systématique de ffmpeg pour la décompression
-#	- utilisation des formats ffmpeg dans %codecs
-#	- réécriture de la détermination du type MIME + %codecs{mime}
-#	- réécriture de la détermination du fichier SOURCE forcé
-# 	- déduction de TRACKSTOTAL du nombre de fichiers traités si absent
-#	- ajout du format ALAC (décompression + tags)
-#	- ajout du format Opus (décompression + compression + tags)
-#	- ajout du format Vorbis (décompression + compression + tags)
-#	- (archive) compression des fichiers sources en FLAC si nécessaire
-#	- correction de bugs sur l'option -c
-#	- correction de bugs en cas de non-(dé)compression (WAV)
-#	- un peu de nettoyage des bouts de code devenus inutiles
-# 0.8.1 :
-#	- conversion UTF-8 de tous les tags et des messages
-#	- extraction du CUE intégré des fichiers wavpack
-# 0.8.2 :
-#	- déduction de TRACKNUMBER du nombre de fichiers déjà traités si absent
-#	- reconstruction des listes de formats supportés
-#	- remplacement de tous les modules et fonctions d'extraction de tags
-#		par Audio::Scan et une fonction unique
-#	- ajout d'un contrôle sur le nombre de disques
-#
-###
-#
-# CNE - 20200517
+# CNE - 20220814
 #
 ###
 use strict;
@@ -74,7 +32,7 @@ use Fcntl;
 use Getopt::Long qw(:config no_ignore_case bundling);
 
 my $prog = basename $0;
-my $version = "0.8.2";
+my $version = "0.8.3";
 
 # Options par défaut
 my $archive;					# Archivage des fichiers sources dans ./SRC/ ?
@@ -840,9 +798,8 @@ sub fic_unique {
 		$fn =~ s/\.[^.]+$//;
 		my $fx = (split (/\./, $fichier))[-1];
 
-		# Si on arrive à dix fichiers identiques, il faudra se poser
-		# des questions...
-		for (my $num = 2; $num <= 10; $num++) {
+		# On a déjà dépassé les 10, alors autant voir large.
+		for (my $num = 2; $num <= 50; $num++) {
 			my $tf = "$fn"." \($num\)"."\.$fx";
 			return "$tf" unless ( -f "$tf" );
 		}
