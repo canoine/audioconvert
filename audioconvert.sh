@@ -15,7 +15,7 @@ FLACDECOPTS="-df"		# FLAC (args)
 FLACENCOPTS="-8f"		# FLAC (args)
 
 WVBIN="wvunpack"		# WAVPACK
-WVDECOPTS=""			# WAVPACK (args)
+WVDECOPTS="-cc"			# WAVPACK (args)
 
 SPLITBIN="bchunk"
 SPLITOPTS="-vw"
