@@ -2,32 +2,39 @@
 set -ue -o pipefail
 
 # Quelques variables
-VERSION="0.5"
+VERSION="0.6"
 
-FORMAT_SRC="FLAC"		# Format des fichiers a traiter
-FORMAT_DEST="FLAC"		# Format des fichiers en fin de traitement
+FORMAT_SRC="FLAC"			# Format des fichiers a traiter
+FORMAT_DEST="FLAC"			# Format des fichiers en fin de traitement
 
-APEBIN="mac"			# Monkey audio
-APEDECOPTS="-d"			# Monkey audio (args)
+APEBIN="mac"				# Monkey audio
+APEDECOPTS="-d"				# Monkey audio (args)
 
-FLACBIN="flac"			# FLAC
-FLACDECOPTS="-df"		# FLAC (args)
-FLACENCOPTS="-8f"		# FLAC (args)
+FLACBIN="flac"				# FLAC
+FLACDECOPTS="-df"			# FLAC (args)
+FLACENCOPTS="-8f"			# FLAC (args)
+FLACTAGBIN="metaflac"			# FLAC
 
-WVBIN="wvunpack"		# WAVPACK
-WVDECOPTS="-cc"			# WAVPACK (args)
+WVBIN="wvunpack"			# WAVPACK
+WVDECOPTS="-cc"				# WAVPACK (args)
 
 SPLITBIN="bchunk"
 SPLITOPTS="-vw"
 
-MPC7ENCBIN="mppenc" 		# Musepack SV7
-MPC8ENCBIN="mpcenc"		# Musepack SV8, pas encore bien supporte...
+CUEPRINT="cueprint"
+
+MPC7ENCBIN="mppenc" 			# Musepack SV7
+MPC8ENCBIN="mpcenc"			# Musepack SV8, pas encore bien supporte...
 MPCENCOPTS="--verbose --insane --deleteinput --overwrite"
 
 MP3BIN="lame"				# MP3
 MP3ENCOPTS="-V 3 --vbr-new --brief"	# MP3 (args)
 
+SPLIT=0
+FIC_SRC=""
 FIC_CUE=""
+FIC_DEC=""
+FIC_TAG=""
 ENCSUPPOPTS=""
 
 ### Fonctions
@@ -183,11 +190,21 @@ function decode_src () {
 	SOURCE="${REP_SRC}/$(basename "$1")"
 
 	FIC_DEC=$(echo "${SOURCE}" | sed s/\.[a-zA-Z0-9]*$/\.wav/)
+	FIC_TAG=$(echo "${SOURCE}" | sed s/\.[a-zA-Z0-9]*$/\.tag/)
 	case ${FORMAT_SRC} in
-		WAV)	echo " *****  Fichier ${SOURCE} non compresse."		;;
-		FLAC)	${FLACBIN} ${FLACDECOPTS} "${SOURCE}"			;;
-		APE)	${APEBIN} "${SOURCE}" "${FIC_DEC}" ${APEDECOPTS}	;;
-		WV)	${WVBIN} ${WVDECOPTS} "${SOURCE}"			;;
+		WAV)
+			echo " *****  Fichier ${SOURCE} non compresse."
+			;;
+		FLAC)
+			${FLACBIN} ${FLACDECOPTS} "${SOURCE}"
+			${FLACTAGBIN} --export-tags-to="${FIC_TAG}" "${SOURCE}"
+			;;
+		APE)
+			${APEBIN} "${SOURCE}" "${FIC_DEC}" ${APEDECOPTS}
+			;;
+		WV)
+			${WVBIN} ${WVDECOPTS} "${SOURCE}"
+			;;
 	esac
 
 	[ $? -eq 0 ] && return 0
@@ -198,8 +215,8 @@ function decode_src () {
 # Decoupage du fichier WAV, s'il contient plusieurs morceaux
 # Necessite un fichier CUE
 function split_wav () {
-	FIC_WAV="$1"
-	FIC_WAV_SPLIT=$(echo "${FIC_WAV}" | sed s/.wav$/_/)
+	local FIC_WAV="$1"
+	local FIC_WAV_SPLIT=$(echo "${FIC_WAV}" | sed s/.wav$/_/)
 
 	if [ -z "${FIC_CUE}" ]
 	then
@@ -230,34 +247,163 @@ function split_wav () {
        		exit 30
 	fi
 
+	echo " *****  Récupération des tags (lorsque c'est possible)."
+	local ARTIST=""
+	local ALBUM=""
+	local DATE=""
+	local TRACKTOTAL=""
+	local DISCNUMBER=""
+	local DISCTOTAL=""
+
+	# On commence par le plus facile : ce qu'on a déjà essayé de récupérer
+	if [ -f "${FIC_TAG}" ]
+	then
+		ARTIST="$(grep ARTIST "${FIC_TAG}" | cut -d '=' -f2 || true)"
+		ALBUM="$(grep ALBUM "${FIC_TAG}" | cut -d '=' -f2 || true)"
+		DATE="$(grep DATE "${FIC_TAG}" | cut -d '=' -f2 || true)"
+		TRACKTOTAL="$(grep TRACKTOTAL "${FIC_TAG}" | cut -d '=' -f2 || true)"
+		DISCNUMBER="$(grep DISCNUMBER "${FIC_TAG}" | cut -d '=' -f2 || true)"
+		DISCTOTAL="$(grep DISCTOTAL "${FIC_TAG}" | cut -d '=' -f2 || true)"
+	fi
+
+	# Et sinon, à partir du fichier .cue
+	[ -n "${ARTIST}" ] || ARTIST="$("${CUEPRINT}" --disc-template '%P\n' "${FIC_CUE}")"
+	[ -n "${ALBUM}" ] || ALBUM="$("${CUEPRINT}" --disc-template '%T\n' "${FIC_CUE}")"
+	[ -n "${DATE}" ] || DATE="$(grep "DATE" "${FIC_CUE}" | head -n 1 | awk '{print $NF}')"
+	[ -n "${TRACKTOTAL}" ] || TRACKTOTAL="$("${CUEPRINT}" --disc-template '%N\n' "${FIC_CUE}")"
+
 	echo " *****  Decoupage du fichier selon les informations fournies par ${FIC_CUE}."
 	${SPLITBIN} ${SPLITOPTS} "${FIC_WAV}" "${FIC_CUE}" "${FIC_WAV_SPLIT}" \
-	 && rm -f "${FIC_WAV}"
-	# && mv "${FIC_WAV}" "${FIC_WAV}.ok"
+	 && rm -f "${FIC_WAV}"	\
+	 && rm -f "${FIC_TAG}"
+
+	for num in $(seq -w 01 ${TRACKTOTAL})
+	do
+		[ -f "${FIC_WAV_SPLIT}${num}.wav" ] || continue
+		local TITLE="$("${CUEPRINT}" --track-number "${num}" "${FIC_CUE}" \
+		       	| grep "^title:" | awk -F ':' '{print $NF}' | sed 's/^[[:space:]]*//g')"
+		echo "ARTIST=${ARTIST}" >"${FIC_WAV_SPLIT}${num}.tag"
+		echo "ALBUM=${ALBUM}" >>"${FIC_WAV_SPLIT}${num}.tag"
+		echo "TITLE=${TITLE}" >>"${FIC_WAV_SPLIT}${num}.tag"
+		echo "DATE=${DATE}" >>"${FIC_WAV_SPLIT}${num}.tag"
+		echo "TRACKNUMBER=${num}" >>"${FIC_WAV_SPLIT}${num}.tag"
+		echo "TRACKTOTAL=${TRACKTOTAL}" >>"${FIC_WAV_SPLIT}${num}.tag"
+		if [ -n "${DISCTOTAL}" ] && [ ${DISCTOTAL} -gt 1 ]
+		then
+			echo "DISCNUMBER=${DISCNUMBER}" >>"${FIC_WAV_SPLIT}${num}.tag"
+			echo "DISCTOTAL=${DISCTOTAL}" >>"${FIC_WAV_SPLIT}${num}.tag"
+		fi
+	done
+}
+
+# Détermination d'un nom unique pour un fichier
+# (on incrémente un compteur s'il existe déjà, quoi...)
+# Argument attendu : <le chemin du fichier>
+fic_unique() {
+	local FUNIQ="${1}"
+	local FN="${FUNIQ%%.*}"
+	local FEXT="${FUNIQ##*.}"
+	if [ -f "${FUNIQ}" ]
+	then
+		for num in $(seq 2 10)
+		do
+			[ ! -f "${FN} ($num).${FEXT}" ] || continue
+			echo "${FN} ($num).${FEXT}"
+			return 0
+		done
+	else
+		echo "${FUNIQ}"
+		return 0
+	fi
+	return 1
 }
 
 # Encodage du fichier WAV
 # Format de sortie selon options donnes au script
 function encode_dest () {
+	local M3U="$(echo "${REP_SRC}" | awk -F '/' '{print $NF}').m3u"
+	[ -f "${M3U}" ] && rm -f "${M3U}"
 	ls "${REP_SRC}"/*.wav | while read fic
 	do
+		local FTAG="$(echo "${fic}" | sed s/.wav$/.tag/)"
+		local ARTIST=""
+		local ALBUM=""
+		local TITLE=""
+		local DATE=""
+		local TRACKNUMBER=""
+		local TRACKTOTAL=""
+		local DISCNUMBER=""
+		local DISCTOTAL=""
+
+		# Nommage du fichier
+		local FENC=""
+		if [ -f "${FTAG}" ]
+		then
+			FENC="$(grep "^TITLE" "${FTAG}" | cut -d '=' -f2)"
+			TITLE="${FENC}"
+			ARTIST="$(grep "^ARTIST" "${FTAG}" | cut -d '=' -f2)"
+			ALBUM="$(grep "^ALBUM" "${FTAG}" | cut -d '=' -f2)"
+			DATE="$(grep "^DATE" "${FTAG}" | cut -d '=' -f2)"
+			TRACKNUMBER="$(grep "^TRACKNUMBER" "${FTAG}" | cut -d '=' -f2)"
+			TRACKTOTAL="$(grep "^TRACKTOTAL" "${FTAG}" | cut -d '=' -f2)"
+			DISCNUMBER="$(grep "^DISCNUMBER" "${FTAG}" | cut -d '=' -f2 || true)"
+			DISCTOTAL="$(grep "^DISCTOTAL" "${FTAG}" | cut -d '=' -f2 || true)"
+		else
+			FENC="$(echo "${fic}" | sed s/.wav$//)"
+		fi
+
 		case "${FORMAT_DEST}" in
-			FLAC)	FIC_ENC=$(echo "$fic" | sed s/.wav$/.flac/)
-				${FLACBIN}	${FLACENCOPTS}	${ENCSUPPOPTS} "$fic" "${FIC_ENC}" \
-				 && rm -vf "$fic"	;;
-			MPC7)	FIC_ENC=$(echo "$fic" | sed s/.wav$/.mpc/)
-				${MPC7ENCBIN}	${MPCENCOPTS}	${ENCSUPPOPTS} "$fic" "${FIC_ENC}" \
-				 && rm -vf "$fic"	;;
-			MPC8)	FIC_ENC=$(echo "$fic" | sed s/.wav$/.mpc/)
-				${MPC8ENCBIN}	${MPCENCOPTS}	${ENCSUPPOPTS} "$fic" "${FIC_ENC}" \
-				 && rm -vf "$fic"	;;
-			MP3)	FIC_ENC=$(echo "$fic" | sed s/.wav$/.mp3/)
+			FLAC)
+				FENC="$(fic_unique "${REP_SRC}/${FENC}.flac")"
+				${FLACBIN} ${FLACENCOPTS} ${ENCSUPPOPTS} --output-name="${FENC}" "${fic}" \
+				 && rm -vf "${fic}"
+				${FLACTAGBIN} --import-tags-from="${FTAG}" "${FENC}" \
+				 && rm -vf "${FTAG}"
+				;;
+			MPC7)
+				FENC="$(fic_unique "${REP_SRC}/${FENC}.mpc")"
+				TAGOPTS="	--artist '"${ARTIST}"'			\
+						--album "${ALBUM}"				\
+						--title '"${TITLE}"'				\
+						--year '${DATE}'				\
+						--track '${TRACKNUMBER}/${TRACKTOTAL}'	\
+					"
+				if [ -n "${DISCTOTAL}" ] && [ ${DISCTOTAL} -gt 1 ]
+				then
+					TAGOPTS="${TAGOPTS} --tag Media='${DISCNUMBER}/${DISCTOTAL}' "
+				fi
+
+				${MPC7ENCBIN} ${MPCENCOPTS} ${ENCSUPPOPTS} ${TAGOPTS} "${fic}" "${FENC}" \
+				 && rm -vf "${fic}" && rm -vf "${FTAG}"
+				;;
+			MPC8)
+				FENC="$(fic_unique "${REP_SRC}/${FENC}.mpc")"
+				TAGOPTS="	--tag Artist=\"${ARTIST}\"			\
+						--tag Album=\"${ALBUM}\"			\
+						--tag Title=\"${TITLE}\"			\
+						--tag Year=\"${DATE}\"				\
+						--tag Track=\"${TRACKNUMBER}/${TRACKTOTAL}\"	\
+					"
+				if [ -n "${DISCTOTAL}" ] && [ ${DISCTOTAL} -gt 1 ]
+				then
+					TAGOPTS="${TAGOPTS} --tag Media=\"${DISCNUMBER}/${DISCTOTAL}\" "
+				fi
+
+				${MPC8ENCBIN} ${MPCENCOPTS} ${ENCSUPPOPTS} ${TAGOPTS} "${fic}" "${FENC}" \
+				 && rm -vf "${fic}" && rm -vf "${FTAG}"
+				;;
+			MP3)
+				FENC="$(fic_unique "${REP_SRC}/${FENC}.mp3")"
 				${MP3BIN}	${MP3ENCOPTS}	${ENCSUPPOPTS} "$fic" "${FIC_ENC}" \
-				 && rm -vf "$fic"	;;
+				 && rm -vf "$fic"
+				;;
 		esac
-		[ $? -eq 0 ] && continue
-	       	echo "$fic : Encodage KO."
-	       	exit 40
+		if [ $? -ne 0 ]
+		then
+	       		echo "${fic} : Encodage KO."
+	       		exit 40
+		fi
+		basename "${FENC}" >>"${REP_SRC}/${M3U}"
 	done
 }
 
