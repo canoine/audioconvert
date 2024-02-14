@@ -1,4 +1,22 @@
 #!/usr/bin/perl
+###
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#
+###
 #
 # Conversion des fichiers audio de divers formats vers divers formats
 #
@@ -12,7 +30,54 @@
 #
 ###
 #
-# CNE - 20220814
+# Changelog :
+# 0.6 :
+#	- réécriture complète du script (intialement en shell) en perl
+#	- écriture des tags
+#	- écriture ou réécriture des playlists M3U
+#	- rééchantillonnement des fichiers WAV selon les codecs et
+#		le format des fichiers WAV
+# 0.7 :
+#	- ajout des options -t en ligne de comande
+#	- ajout des tags ReplayGain
+#	- création et utilisation de tags globaux
+#	- détection du clipping et application du niveau de réduction du signal
+#	- option forcée ou non de déplacement des fichiers SOURCE et CUE
+# 		dans un sous-répertoire ./SRC/
+# 0.8 :
+#	- remplacement de cueprint, décidément trop capricieux, par une fonction
+#	- remplacement de metaflac par une fonction pour l'extraction des tags FLAC
+#	- utilisation systématique d'une fonction pour l'extraction des tags
+#	- utilisation systématique de ffmpeg pour la décompression
+#	- utilisation des formats ffmpeg dans %codecs
+#	- réécriture de la détermination du type MIME + %codecs{mime}
+#	- réécriture de la détermination du fichier SOURCE forcé
+# 	- déduction de TRACKSTOTAL du nombre de fichiers traités si absent
+#	- ajout du format ALAC (décompression + tags)
+#	- ajout du format Opus (décompression + compression + tags)
+#	- ajout du format Vorbis (décompression + compression + tags)
+#	- (archive) compression des fichiers sources en FLAC si nécessaire
+#	- correction de bugs sur l'option -c
+#	- correction de bugs en cas de non-(dé)compression (WAV)
+#	- un peu de nettoyage des bouts de code devenus inutiles
+# 0.8.1 :
+#	- conversion UTF-8 de tous les tags et des messages
+#	- extraction du CUE intégré des fichiers wavpack
+# 0.8.2 :
+#	- déduction de TRACKNUMBER du nombre de fichiers déjà traités si absent
+#	- reconstruction des listes de formats supportés
+#	- remplacement de tous les modules et fonctions d'extraction de tags
+#		par Audio::Scan et une fonction unique
+#	- ajout d'un contrôle sur le nombre de disques
+# 0.8.3 :
+#	- augmentation du nombre de fichiers "uniques" possibles
+# 0.9.0 :
+#	- prise en charge de plusieurs types MIME pour chaque codec supporté
+#	- reformatage de messages de debug
+#
+###
+#
+# CNE - 20240214
 #
 ###
 use strict;
@@ -32,7 +97,7 @@ use Fcntl;
 use Getopt::Long qw(:config no_ignore_case bundling);
 
 my $prog = basename $0;
-my $version = "0.8.3";
+my $version = "0.9.0";
 
 # Options par défaut
 my $archive;					# Archivage des fichiers sources dans ./SRC/ ?
@@ -151,13 +216,17 @@ my @tags_title = (
 #		enc_verb_opt	=>	"--verbose",		# scalaire
 #		enc_vol_opt		=>	"--option=",		# chaîne scalaire
 #		ext				=>	"extension",		# scalaire
-#		mime			=>	"type/MIME",		# scalaire
+#		mime			=>	[					# tableau
+#			"type/MIME",							# scalaire
+#			"type/MIME",							# scalaire
+#			(...)
+#		],
 #		rpg_bin			=>	"exécutable",		# scalaire
 #		rpg_opts		=>	""--options",		# chaîne scalaire
 #		tags			=>	{					# hash
-#			TAG1			=>	'nom',			# scalaire
-#			TAG2			=>	'nom',			# scalaire
-#			(...)								# liste des tags : @def_tags
+#			TAG1			=>	'nom',				# scalaire
+#			TAG2			=>	'nom',				# scalaire
+#			(...)									# liste des tags : @def_tags
 #		}
 #	},
 #
@@ -188,28 +257,34 @@ my %codecs = (
 # En décompression uniquement, parce que, bon, faut pas déconner non plus, hein.
 	'alac'	=>	{
 		ext				=>	"m4a",
-		mime			=>	"audio/mp4"
+		mime			=>	[
+			"audio/mp4"
+		]
 	},
 
 # Monkey's Audio
 # Lossless, mais privateur. Et leeeeeeeent.
 # En décompression uniquement.
 	'ape'	=>	{
-		mime			=>	"audio/x-ape"
+		mime			=>	[
+			"audio/x-ape"
+		]
 	},
 
-# Direct Stream Digital
+# Direct Stream Digital/Super Audio CD
 # Plus un procédé de stockage qu'un format, créé par Sony et Philips.
-# Aucune idée du type de licence
+# Marque déposée, évidemment.
 # En "décompression" uniquement.
 	'dsd'	=>	{
 		ext				=>	"dsf",
-		#mime			=>	"audio/x-dsd", # rien d'officiel, inconnu du shell
-		mime			=>	"application/octet-stream"
+		mime			=>	[
+			"audio/x-dsd",
+			"application/octet-stream"
+		]
 	},
 
 # Free Lossless Audio Codec
-# Libre, rapide, et Lossless.
+# Libre, rapide, et lossless.
 # Utilisé par défaut pour les fichiers archives (./SRC/)
 # Sert aussi à déterminer le niveau de clipping.
 	'flac'	=>	{
@@ -217,7 +292,9 @@ my %codecs = (
 		enc_info_opt	=>	"--silent",
 		enc_opts		=>	"--best --force --output-name",
 		enc_tags_opts	=>	"--tag=",
-		mime			=>	"audio/flac",
+		mime			=>	[
+			"audio/flac"
+		],
 		rpg_bin			=>	"metaflac",
 		rpg_opts		=>	"--add-replay-gain",
 		tags			=>	{
@@ -243,7 +320,10 @@ my %codecs = (
 		enc_verb_opt	=>	"--verbose",
 		enc_vol_opt		=>	"--scale",
 		enc_info_opt	=>	"--brief",
-		mime			=>	"audio/mpeg",
+		mime			=>	[
+			"audio/mpeg",
+			"audio/mp3"
+		],
 		tags			=>	{
 			ARTIST			=>	'--ta',
 			ALBUM			=>	'--tl',
@@ -279,7 +359,9 @@ my %codecs = (
 		enc_verb_opt	=>	"--verbose",
 		enc_vol_opt		=>	"--scale",
 		ext				=>	"mpc",
-		mime			=>	"audio/x-musepack",
+		mime			=>	[
+			"audio/x-musepack"
+		],
 		rpg_bin			=>	"replaygain",
 		rpg_opts			=>	"--auto",
 		tags			=>	{
@@ -307,7 +389,9 @@ my %codecs = (
 		enc_verb_opt	=>	"--verbose",
 		enc_vol_opt		=>	"--scale",
 		ext				=>	"mpc",
-		mime			=>	"audio/x-musepack",
+		mime			=>	[
+			"audio/x-musepack"
+		],
 		rpg_bin			=>	"mpcgain",
 		tags			=>	{
 			ARTIST			=>	'ARTIST',
@@ -330,7 +414,10 @@ my %codecs = (
 		enc_opts		=>	"--bitrate 192",
 		enc_tags_opts	=>	"",
 		enc_info_opt	=>	"--quiet",
-		mime			=>	"audio/x-opus+ogg",
+		mime			=>	[
+			"audio/opus",
+			"audio/x-opus+ogg"
+		],
 		tags			=>	{
 			ARTIST			=>	'--artist',
 			ALBUM			=>	'--album',
@@ -352,7 +439,10 @@ my %codecs = (
 		enc_tags_opts	=>	"",
 		enc_info_opt	=>	"--quiet",
 		ext				=>	"ogg",
-		mime			=>	"audio/x-vorbis+ogg",
+		mime			=>	[
+			"audio/ogg",
+			"audio/x-vorbis+ogg"
+		],
 		tags			=>	{
 			ARTIST			=>	'--artist',
 			ALBUM			=>	'--album',
@@ -367,11 +457,13 @@ my %codecs = (
 	},
 
 # Wavpack
-# Libre, mais pas forcément Lossless.
+# Libre, mais pas forcément lossless.
 # En décompression uniquement.
 	'wavpack'	=>	{
 		ext				=>	"wv",
-		mime			=>	"audio/x-wavpack"
+		mime			=>	[
+			"audio/x-wavpack"
+		]
 	},
 
 # Waveform Audio File Format
@@ -380,7 +472,14 @@ my %codecs = (
 # Le tag TITLE est utile pour renommer le fichier si -O wav.
 	'wav'	=>	{
 		enc_bin			=>	"true",
-		mime			=>	"audio/x-wav",
+		mime			=>	[
+			"audio/vnd.wav",
+			"audio/vnd.wave",
+			"audio/wav",
+			"audio/wave",
+			"audio/x-pn-wav",
+			"audio/x-wav"
+		],
 		tags			=>	{
 			TITLE			=>	'TITLE'
 		}
@@ -470,7 +569,7 @@ sub sortie_erreur {
 # Renvoie 1 si la commande sort en erreur, et rien sinon.
 # Argument attendu : <la commande>
 sub commande_ok {
-	msg_debug("sub commande_ok");
+	msg_debug("-SUB- commande_ok");
 
 	my $commande = shift;
 	chomp $commande;
@@ -490,7 +589,7 @@ sub commande_ok {
 # - sous forme de tableau sinon
 # Argument attendu : <la commande>
 sub commande_res {
-	msg_debug("sub commande_res");
+	msg_debug("-SUB- commande_res");
 
 	my $commande = shift;
 	chomp $commande;
@@ -525,11 +624,11 @@ sub uc_clefs_hash {
 # Ne renvoie rien
 # Arguments attendus : aucun
 sub make_formats {
-	msg_debug("sub make_formats");
+	msg_debug("-SUB- make_formats");
 
 	# Décompression
 	foreach my $fmt ( sort(keys %codecs) ) {
-		push (@decformats, "$fmt") if ( defined $codecs{$fmt}{mime} );
+		push (@decformats, "$fmt") if ( defined $codecs{$fmt}{mime}[0] );
 	}
 
 	# Compression
@@ -545,7 +644,7 @@ sub make_formats {
 # Supprime un fichier, ou le renomme si le mode debug est activé
 # Argument attendu : <le chemin du fichier>
 sub suppr_fic {
-	msg_debug("sub suppr_fic");
+	msg_debug("-SUB- suppr_fic");
 
 	my $chemin = shift;
 	if ( -f "$chemin" ) {
@@ -567,7 +666,7 @@ sub suppr_fic {
 # (mais ne sort pas) s'il n'est pas trouvé
 # Argument attendu : <le nom du binaire>
 sub chem_bin_ou_continue {
-	msg_debug("sub chem_bin_ou_continue");
+	msg_debug("-SUB- chem_bin_ou_continue");
 
 	my $binaire = shift;
 	chomp $binaire;
@@ -580,7 +679,7 @@ sub chem_bin_ou_continue {
 # Recherche du chemin d'un binaire et sortie en erreur s'il n'est pas trouvé
 # Argument attendu : <le nom du binaire>
 sub chem_bin_ou_stop {
-	msg_debug("sub chem_bin_ou_stop");
+	msg_debug("-SUB- chem_bin_ou_stop");
 
 	my $binaire = shift;
 	chomp $binaire;
@@ -601,7 +700,7 @@ sub chem_bin {
 # Sort en erreur sinon
 # Argument attendu : <le chemin à tester>
 sub fic_ou_rep {
-	msg_debug("sub fic_ou_rep");
+	msg_debug("-SUB- fic_ou_rep");
 
 	my $chemin = shift;
 	my $ficrep;
@@ -629,7 +728,7 @@ sub fic_ou_rep {
 # Renvoie le chemin du fichier trouvé, ou "__inconnu__" sinon
 # Argument attendu : <le chemin à tester>
 sub fic_exist {
-	msg_debug("sub fic_exist");
+	msg_debug("-SUB- fic_exist");
 
 	my $chemin = shift;
 	if ( -f "$chemin" ) {
@@ -651,7 +750,7 @@ sub fic_exist {
 # Renvoie le chemin du répertoire trouvé, ou "__inconnu__" sinon
 # Argument attendu : <le chemin à tester>
 sub rep_exist {
-	msg_debug("sub rep_exist");
+	msg_debug("-SUB- rep_exist");
 
 	my $chemin = shift;
 	if ( -d "$chemin" ) {
@@ -672,7 +771,7 @@ sub rep_exist {
 # ou le nom du fichier selon le chemin donné
 # Argument attendu : <le chemin a parcourir>
 sub recup_liste_fics {
-	msg_debug("sub recup_liste_fics");
+	msg_debug("-SUB- recup_liste_fics");
 
 	my $rep = shift;
 	chomp $rep;
@@ -706,7 +805,7 @@ sub recup_liste_fics {
 # ou du fichier selon le chemin donné
 # Argument attendu : <le chemin a parcourir>
 sub detect_formats {
-	msg_debug("sub detect_formats");
+	msg_debug("-SUB- detect_formats");
 
 	my $chemin = shift;
 
@@ -728,35 +827,42 @@ sub detect_formats {
 # Détermine le format d'un fichier (type MIME, ou extension)
 # Argument attendu : <le chemin du fichier à tester>
 sub fic_format {
-	msg_debug("sub fic_format");
+	msg_debug("-SUB- fic_format");
 
 	my $fichier = shift;
 	my $format;
 	my $mime_type = mimetype("$fichier");
 	msg_debug("format du fichier $fichier : $mime_type");
 
+	# Là, la seule possibilité, c'est l'extension...
+	if ( $mime_type eq "application/octet-stream" ) {
+		my $ext = (split(/\./, $fichier))[-1];
+		foreach my $dfmt ( @decformats ) {
+			if ( ( defined $codecs{$dfmt}{ext} )
+				&& ( $ext eq $codecs{$dfmt}{ext} ) ) {
+				msg_debug(" -FMT-MIME-STREAM- : $dfmt");
+				return "$dfmt";
+			}
+		}
+		msg_debug(" -FMT-MIME-STREAM- : __inconnu__");
+		return "__inconnu__";
+	}
+
+	# Sinon...
 	# Comme ça, on est sûr de prendre tous les formats supportés
 	foreach my $fmt ( keys %codecs ) {
-		next unless ( ( defined $codecs{$fmt}{mime} )
-			&& ( $mime_type eq $codecs{$fmt}{mime} ) );
-
-		if ( $mime_type eq "application/octet-stream" ) {
-			# Là, la seule possibilité, c'est l'extension...
-			my $ext = (split(/\./, $fichier))[-1];
-			if ( ( defined $codecs{$fmt} ) && ( $ext eq $fmt ) ) {
-				msg_debug(" -FMT- : $fmt");
+		msg_debug(" -FORMAT-TEST- : $fmt");
+		foreach my $tmime ( @{$codecs{$fmt}{mime}} ) {
+			msg_debug(" -MIME-TEST- : $tmime");
+			if ( $mime_type eq $tmime ) {
+				msg_debug(" -FMT-MIME- : $fmt");
 				return "$fmt";
 			}
-			if ( ( defined $codecs{$fmt}{ext} )
-				&& ( $ext eq $codecs{$fmt}{ext} ) ) {
-				msg_debug(" -FMT- : $fmt");
-				return "$fmt";
-			}
-			return "__inconnu__";
 		}
-		msg_debug(" -MIME- : $fmt");
-		return "$fmt";
 	}
+
+	# Quand tout a été tenté...
+	msg_debug(" -FMT-FIN- : __inconnu__");
 	return "__inconnu__";
 }
 
@@ -764,7 +870,7 @@ sub fic_format {
 # Sort en erreur si inconnu
 # Argument attendu : <un format>
 sub int_format {
-	msg_debug("sub int_format");
+	msg_debug("-SUB- int_format");
 
 	my $fmt = shift;
 	$fmt = lc($fmt);
@@ -789,7 +895,7 @@ sub int_format {
 # (on incrémente un compteur s'il existe déjà, quoi...)
 # Argument attendu : <le chemin du fichier>
 sub fic_unique {
-	msg_debug("sub fic_unique");
+	msg_debug("-SUB- fic_unique");
 
 	my $fichier = shift;
 	if ( -f "$fichier" ) {
@@ -813,7 +919,7 @@ sub fic_unique {
 # Essaie de trouver le fichier .CUE qui va avec le fichier source donné
 # Argument attendu : <le chemin du fichier à tester>
 sub recup_cue {
-	msg_debug("sub recup_cue");
+	msg_debug("-SUB- recup_cue");
 
 	my $fic = shift;
 
@@ -869,7 +975,7 @@ sub recup_cue {
 # Le but est de sortir avec uniquement des fichiers WAV
 # Argument attendu : <le chemin de la source>
 sub decompress_src {
-	msg_debug("sub decompress_src");
+	msg_debug("-SUB- decompress_src");
 
 	my $chemin = shift;
 
@@ -897,7 +1003,7 @@ sub decompress_src {
 # Décompression d'un (et un seul) fichier source
 # Argument attendu : <le chemin du fichier>
 sub decompress_fic {
-	msg_debug("sub decompress_fic");
+	msg_debug("-SUB- decompress_fic");
 
 	my $fic_orig = shift;
 
@@ -998,7 +1104,7 @@ sub decompress_fic {
 # Renvoie la chaîne modifiée
 # Argument attendu : <la chaîne de caractères>
 sub reformat_chaine {
-	msg_debug("sub reformat_chaine");
+	msg_debug("-SUB- reformat_chaine");
 
 	my $chaine = shift;
 	msg_debug(" -REFORMAT-AVANT- $chaine");
@@ -1014,7 +1120,7 @@ sub reformat_chaine {
 # Retourne un tableau associatif avec les valeurs attendues.
 # Argument attendu : <le chemin du fichier>
 sub extract_tags {
-	msg_debug("sub extract_tags");
+	msg_debug("-SUB- extract_tags");
 
 	my $fic = shift;
 	my %tags;
@@ -1167,7 +1273,7 @@ sub extract_tags {
 # Ne renvoie rien
 # Argument attendu : <un hash de tags>
 sub maj_gtags {
-	msg_debug("sub maj_gtags");
+	msg_debug("-SUB- maj_gtags");
 
 	my %tmptags = @_;
 	foreach my $gtag (@def_tags) {
@@ -1222,7 +1328,7 @@ sub maj_gtags {
 # Retourne le nom du fichier CUE
 # Argument attendu : <le chemin du fichier SOURCE>
 sub extract_CUE {
-	msg_debug("sub extract_CUE");
+	msg_debug("-SUB- extract_CUE");
 
 	my $fic = shift;
 
@@ -1290,7 +1396,7 @@ sub extract_CUE {
 #	},
 # Argument attendu : <le chemin du fichier CUE>
 sub extract_CUE_infos {
-	msg_debug("sub extract_CUE_infos");
+	msg_debug("-SUB- extract_CUE_infos");
 
 	my $lcue = shift;
 	my %cuetags;
@@ -1386,7 +1492,7 @@ sub extract_CUE_infos {
 # Nécessite un fichier CUE
 # Argument attendu : <le chemin du fichier>
 sub split_wav {
-	msg_debug("sub split_wav");
+	msg_debug("-SUB- split_wav");
 
 	my $fwav = shift;
 	msg_info("découpage du fichier $fwav");
@@ -1460,7 +1566,7 @@ sub split_wav {
 # Ne renvoie rien
 # Argument attendu : <le chemin du fichier>
 sub archive_fic {
-	msg_debug("sub archive_fic");
+	msg_debug("-SUB- archive_fic");
 
 	my $chemin = shift;
 
@@ -1485,7 +1591,7 @@ sub archive_fic {
 # Renvoie le chemin du fichier compressé
 # Argument attendu : <le chemin du fichier>
 sub compress_archive {
-	msg_debug("sub compress_archive");
+	msg_debug("-SUB- compress_archive");
 
 	my $chemin = shift;
 	$chemin = fic_exist("$chemin");
@@ -1514,7 +1620,7 @@ sub compress_archive {
 # Renomme les fichiers "ARTIST - ALBULM.ext" si les tags globaux existent.
 # Arguments attendus : aucun
 sub archive_src {
-	msg_debug("sub archive_src");
+	msg_debug("-SUB- archive_src");
 	msg_info("archivage des fichiers source");
 
 	my $arch_src = $fic_src;	# Fichier SOURCE
@@ -1610,7 +1716,7 @@ sub archive_src {
 # Ne renvoie rien
 # Argument attendu : <le chemin de la source>
 sub concat_m3u {
-	msg_debug("sub concat_m3u");
+	msg_debug("-SUB- concat_m3u");
 
 	my $chemin = shift;
 
@@ -1651,7 +1757,7 @@ sub concat_m3u {
 # et renvoie la liste sous forme de tableau
 # Argument attendu : <le chemin de la source>
 sub recup_m3u {
-	msg_debug("sub recup_m3u");
+	msg_debug("-SUB- recup_m3u");
 
 	my $chemin = shift;
 	my $rep = $chemin;
@@ -1714,7 +1820,7 @@ sub recup_m3u {
 # Ne renvoie rien
 # Argument attendu : <le chemin du répertoire source>
 sub ajout_RGtags {
-	msg_debug("sub ajout_RGtags");
+	msg_debug("-SUB- ajout_RGtags");
 
 	my $chemin = shift;
 
@@ -1769,7 +1875,7 @@ sub ajout_RGtags {
 # Renvoie une valeur comprise entre 0 et 1
 # Arguments attendus : @les fichiers
 sub calcul_clip {
-	msg_debug("sub calcul_clip");
+	msg_debug("-SUB- calcul_clip");
 
 	my @fics_wav = @_;
 	my @fics_cps;
@@ -1873,7 +1979,7 @@ sub calcul_clip {
 # Compression du ou des fichiers WAV trouvés
 # Argument attendu : <le chemin de la source>
 sub compress_dest {
-	msg_debug("sub compress_dest");
+	msg_debug("-SUB- compress_dest");
 
 	my $chemin = shift;
 
@@ -1993,7 +2099,7 @@ sub compress_dest {
 # Compression d'un (et un seul) fichier source
 # Argument attendu : <le chemin du fichier>
 sub compress_fic {
-	msg_debug("sub compress_fic");
+	msg_debug("-SUB- compress_fic");
 
 	my $fwav = shift;
 
@@ -2219,7 +2325,7 @@ sub compress_fic {
 # et les renvoie sous forme de tableau
 # Argument attendu : <le chemin du fichier>
 sub extract_WAV_infos {
-	msg_debug("sub extract_WAV_infos");
+	msg_debug("-SUB- extract_WAV_infos");
 
 	my $fwav = shift;
 	my ($fmt, $d);
@@ -2274,7 +2380,7 @@ sub arguments {
 	$debug   = 1 if ( defined $lconfig{debug} );
 	$verbose = 1 if ( defined $lconfig{debug} );
 	$verbose = 1 if ( defined $lconfig{verbose} );
-	msg_debug("sub arguments");
+	msg_debug("-SUB- arguments");
 	msg_verb("$prog v$version");
 
 	# Fichier source
