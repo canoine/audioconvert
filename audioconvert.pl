@@ -74,6 +74,8 @@
 # 0.9.0 :
 #	- prise en charge de plusieurs types MIME pour chaque codec supporté
 #	- reformatage de messages de debug
+# 0.9.1 :
+#	- correction des options MP3
 #
 ###
 #
@@ -97,7 +99,7 @@ use Fcntl;
 use Getopt::Long qw(:config no_ignore_case bundling);
 
 my $prog = basename $0;
-my $version = "0.9.0";
+my $version = "0.9.1";
 
 # Options par défaut
 my $archive;					# Archivage des fichiers sources dans ./SRC/ ?
@@ -2260,6 +2262,7 @@ sub compress_fic {
 		$lenc_opts .= " $fmt_dst{enc_tags_opts}";
 		if ( %tags ) {
 			foreach my $tag ( keys %tags ) {
+				next if ( $tag eq "ALBUMARTIST" );
 				next if ( $tag eq "TRACKNUMBER" );
 				next if ( $tag eq "TRACKSTOTAL" );
 				next if ( $tag eq "DISCNUMBER" );
@@ -2267,12 +2270,17 @@ sub compress_fic {
 				$lenc_opts .= " $fmt_dst{tags}{$tag} \"$tags{$tag}\"";
 			}
 		}
+		# Albumartist
+		if ( defined $tags{ALBUMARTIST} ) {
+			$lenc_opts .= " $fmt_dst{enc_tags_opts}".
+					" $fmt_dst{tags}{ALBUMARTIST}=\"$tags{ALBUMARTIST}\"";
+		}
 		# Numéros de morceaux
 		if ( defined $tags{TRACKNUMBER} ) {
 			$tags{TRACKNUMBER} = "$tags{TRACKNUMBER}/$tags{TRACKSTOTAL}"
 				if ( defined $tags{TRACKSTOTAL} );
 			$lenc_opts .= " $fmt_dst{enc_tags_opts}".
-					" $fmt_dst{tags}{TRACKNUMBER}=\"$tags{TRACKNUMBER}\"";
+					" $fmt_dst{tags}{TRACKNUMBER} \"$tags{TRACKNUMBER}\"";
 		}
 		# Numéros de disques
 		if ( defined $tags{DISCNUMBER} ) {
@@ -2282,7 +2290,7 @@ sub compress_fic {
 		}
 
 		# Compression du fichier
-		commande_ok("'$enc_bin' $lenc_opts \"$fwav\"")
+		commande_ok("'$enc_bin' $lenc_opts \"$fwav\" \"$fic_cps\"")
 			or sortie_erreur("impossible de compresser le fichier $fwav");
 	}
 
