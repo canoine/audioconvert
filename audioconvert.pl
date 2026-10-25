@@ -76,6 +76,9 @@
 #	- reformatage de messages de debug
 # 0.9.1 :
 #	- correction des options MP3
+# 0.9.2 :
+#	- renommage des fichiers MP3
+#	- modification du format de sortie par défaut : MP3
 #
 ###
 #
@@ -99,7 +102,7 @@ use Fcntl;
 use Getopt::Long qw(:config no_ignore_case bundling);
 
 my $prog = basename $0;
-my $version = "0.9.1";
+my $version = "0.9.2";
 
 # Options par défaut
 my $archive;					# Archivage des fichiers sources dans ./SRC/ ?
@@ -114,7 +117,7 @@ my $fic_src;					# Nom du fichier ou du répertoire SOURCE
 my $fic_wav;					# Nom du fichier WAV
 my $fmt_arch	= 'flac';		# Format des fichiers archivés (dans ./SRC/)
 my $fmt_src		= 'flac';		# Format des fichiers sources
-my $fmt_dst		= 'musepack7';	# Format des fichiers destinations
+my $fmt_dst		= 'mp3';		# Format des fichiers destinations
 my %gtags;						# Ensemble des tags globaux
 my $noclip;						# Doit-on désactiver le calcul anti-clipping ?
 my $noreplaygain;				# Doit-on désactiver les tags ReplayGain ?
@@ -2148,7 +2151,19 @@ sub compress_fic {
 	# Nom du fichier compressé
 	my $rep_cps = dirname "$fwav";
 	my $fic_cps = $fwav;
-	# Si on a accès aux tags, le nom sera le titre. Parce que voilà.
+	# Si on a accès aux tags, le nom sera, dans l'ordre :
+	# n° disque + n° track + titre
+	# n° track + titre
+	# titre
+	my $nomtrack;
+	if ( defined $tags{TRACKNUMBER} ) {
+		if ( defined $tags{DISCNUMBER} ) {
+			$nomtrack = "$tags{DISCNUMBER}$tags{TRACKNUMBER} - ";
+		}
+		else {
+			$nomtrack = "$tags{TRACKNUMBER} - ";
+		}
+	}
 	if ( defined $tags{TITLE} ) {
 		my $tmp_fic = "$tags{TITLE}"."\.$fext";
 		# Il y a quelques caractères interdits.
@@ -2157,7 +2172,7 @@ sub compress_fic {
 		$tmp_fic =~ s/\\/-/g;
 		$tmp_fic =~ s/\//-/g;
 		$tmp_fic =~ s/\*/-/g;
-		$fic_cps = fic_unique("$rep_cps/$tmp_fic");
+		$fic_cps = fic_unique("$rep_cps/$nomtrack$tmp_fic");
 	}
 	# Sinon, le nom est déterminé à partir de celui du fichier WAV.
 	elsif ( "$fmt_dst" ne "wav" ) {
